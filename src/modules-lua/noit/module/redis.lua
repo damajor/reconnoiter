@@ -43,7 +43,13 @@ function onload(image)
         Specifies the port on which redis is running.
     </parameter>
     <parameter name="command" required="required" default="INFO" allowed=".+">
-            Command to send to redis server.
+        Command to send to redis server.
+    </parameter>
+    <parameter name="dbindex" required="optional" default="0" allowed="\d+">
+        Index of the database the command will run against
+    </parameter>
+    <parameter name="password" required="optional" default="" allowed=".+">
+        Auth password for redis
     </parameter>
   </checkconfig>
   <examples>
@@ -80,14 +86,15 @@ function config(module, options)
 end
 
 function initiate(module, check)
-  local host = check.config.host or check.target_ip or check.target
-  local port = check.config.port or 6379
+  local config = check.interpolate(check.config)
+  local host = config.host or check.target_ip or check.target
+  local port = config.port or 6379
 
   -- default to bad
   check.bad();
   check.unavailable();
 
-  local redis_comm = build_redis_command(check.config.command or "info")
+  local redis_comm = build_redis_command(config.command or "info")
 
   local conn = noit.socket(host)
   local rv, err = conn:connect(host, port)
@@ -96,11 +103,31 @@ function initiate(module, check)
     return
   end
 
+  if ( config.password ~= nil and config.password ~= "" ) then
+    conn:write(build_redis_command("AUTH " .. config.password))
+    conn:read(1)
+    local status = string.sub(conn:read("\r\n"), 1, -3)
+    if ( status ~= "OK" ) then
+      check.status("could not authenticate " .. " (" .. status .. ")")
+      return
+    end
+  end
+
+  if ( config.dbindex ~= nil and config.dbindex ~= 0 ) then
+    conn:write(build_redis_command("SELECT " .. config.dbindex))
+    conn:read(1)
+    local status = string.sub(conn:read("\r\n"), 1, -3)
+    if ( status ~= "OK" ) then
+      check.status("could not select dbindex " .. config.dbindex .. " (" .. status .. ")")
+      return
+    end
+  end
+
   conn:write(redis_comm)
   local metric_count = 0
 
-  if ( check.config.command ~= nil and check.config.command:upper() ~= "INFO" ) then
-    metric_count = get_command_metrics(conn, check)
+  if ( config.command ~= nil and not string.find(config.command:upper(), "^INFO") ) then
+    metric_count = get_command_metrics(conn, check, config)
   else
     metric_count = get_info_metrics(conn, check)
   end
@@ -116,7 +143,7 @@ function build_redis_command(command)
   local redis_comm = "*"
   local comm_list = string.split(command, "%s+")
 
-  redis_comm = redis_comm .. table.getn(comm_list) .. "\r\n"
+  redis_comm = redis_comm .. #comm_list .. "\r\n"
 
   for c in ipairs(comm_list) do
     redis_comm = redis_comm .. "$" .. comm_list[c]:len() .. "\r\n" .. comm_list[c] .. "\r\n"
@@ -137,42 +164,41 @@ function get_info_metrics(conn, check)
   local list = string.split(redis_result, "\r\n")
 
   for line in pairs(list) do
-    if ( list[line] == "" or list[line] == nil) then
-      break
-    end
-    kv = string.split(list[line], ":")
+    if ( list[line] ~= "" and string.sub(list[line], 1, 1) ~= "#" ) then
+      kv = string.split(list[line], ":")
 
-    -- see if this is db* data
-    if ( string.find(kv[1], "^db%d+$") ) then
-      db_metrics = string.split(kv[2], ",")
-      for idx in pairs(db_metrics) do
-        count = count + 1
-        met = string.split(db_metrics[idx], "=")
-        metric_data["metric_name"] = kv[1] .. "`" .. met[1]
-        add_check_metric(met[2], check, metric_data)
-      end
-    elseif ( string.find(kv[1], "^allocation_stats$") ) then
-      alloc_metrics = string.split(kv[2], ",")
-      for idx in pairs(alloc_metrics) do
-        count = count + 1
-        met = string.split(alloc_metrics[idx], "=")
-        if ( 3 == table.getn(met) ) then
-            check.metric_int32("allocation_stats`" .. met[2], met[3])
-        else
-            check.metric_int32("allocation_stats`" .. met[1], met[2])
+      -- lines with = in them contain multiple metrics, ex. db0, cmdstat
+      if ( string.find(kv[2], "=") ) then
+        multi_metrics = string.split(kv[2], ",")
+        for idx in pairs(multi_metrics) do
+          count = count + 1
+          met = string.split(multi_metrics[idx], "=")
+          metric_data["metric_name"] = kv[1] .. "`" .. met[1]
+          add_check_metric(met[2], check, metric_data)
         end
+      elseif ( string.find(kv[1], "^allocation_stats$") ) then
+        alloc_metrics = string.split(kv[2], ",")
+        for idx in pairs(alloc_metrics) do
+          count = count + 1
+          met = string.split(alloc_metrics[idx], "=")
+          if ( 3 == #met ) then
+              check.metric_int32("allocation_stats`" .. met[2], met[3])
+          else
+              check.metric_int32("allocation_stats`" .. met[1], met[2])
+          end
+        end
+      else
+        count = count + 1
+        metric_data["metric_name"] = kv[1]
+        add_check_metric(kv[2], check, metric_data)
       end
-    else
-      count = count + 1
-      metric_data["metric_name"] = kv[1]
-      add_check_metric(kv[2], check, metric_data)
     end
   end
 
   return count
 end
 
-function get_command_metrics(conn, check)
+function get_command_metrics(conn, check, config)
   -- the only metric name we know is what we are sending to redis
   local metric_data = {}
   metric_data["hash_key"] = nil
@@ -180,7 +206,7 @@ function get_command_metrics(conn, check)
   metric_data["need_key"] = 0
   metric_data["names"] = {}
 
-  local cs = string.split(check.config.command, "%s+")
+  local cs = string.split(config.command, "%s+")
   if ( string.find(cs[1]:upper(), "HGET") ) then
     metric_data["hash_key"] = cs[2]
   elseif ( string.find(cs[1]:upper(), "MGET") ) then
@@ -272,9 +298,9 @@ function redis_response_error(conn, check)
   return 0
 end
 
-function redis_response_null(check, metric_data)
-  check.metric_string(metric_data["metric_name"], nil)
-  return 1
+function redis_response_null(check)
+  check.status("nil value from server")
+  return 0
 end
 
 function add_check_metric(value, check, metric_data)
@@ -282,6 +308,11 @@ function add_check_metric(value, check, metric_data)
     check.metric_uint64(metric_data["metric_name"], value)
   elseif ( string.find(value, "^%d+?.%d+$") ) then
     check.metric_double(metric_data["metric_name"], value)
+  elseif ( string.find(value, "^{") ) then
+    local cnt = check.metric_json("{\"" .. metric_data["metric_name"] .. "\":" .. value .. "}")
+    if ( cnt < 0 ) then
+      check.metric(metric_data["metric_name"], value)
+    end
   else
     check.metric(metric_data["metric_name"], value)
   end

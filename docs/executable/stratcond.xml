@@ -1,19 +1,15 @@
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.4//EN"
-  "http://www.oasis-open.org/docbook/xml/4.4/docbookx.dtd"
-[
-  <!ENTITY % magic.fixup SYSTEM "http://labs.omniti.com/docbook/ent">
-  %magic.fixup;
-]>
-
-<refentry id="executable.stratcond">
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-model href="http://docbook.org/xml/5.0/rng/docbookxi.rng" schematypens="http://relaxng.org/ns/structure/1.0"?>
+<?xml-model href="http://docbook.org/xml/5.0/rng/docbook.rng" type="application/xml" schematypens="http://purl.oclc.org/dsdl/schematron"?>
+<refentry xmlns="http://docbook.org/ns/docbook"
+          xmlns:xi="http://www.w3.org/2001/XInclude"
+          xmlns:xlink="http://www.w3.org/1999/xlink"
+          version="5.0"
+          xml:id="executable.stratcond">
   <refmeta>
     <refentrytitle>stratcond</refentrytitle>
     <manvolnum>8</manvolnum>
   </refmeta>
-
-  <refentryinfo>
-    <date>09/08/2008</date>
-  </refentryinfo>
 
   <refnamediv>
     <refname>stratcond</refname>
@@ -28,6 +24,7 @@
       <arg choice="opt">-u <replaceable>user</replaceable></arg>
       <arg choice="opt">-g <replaceable>group</replaceable></arg>
       <arg choice="opt">-t <replaceable>path</replaceable></arg>
+      <arg choice="opt">-n <replaceable>address:port</replaceable></arg>
       <arg choice="opt">-d</arg>
       <arg choice="opt">-D</arg>
       <arg choice="opt">-l <replaceable>logstream</replaceable></arg>
@@ -72,6 +69,17 @@
       </para>
     </listitem>
   </varlistentry>
+  <varlistentry><term><option>-n</option></term>
+    <listitem>
+      <para>
+        Optionally specifies an address to *not* listen on. It can be
+        a unix path (:port omitted), just a port (:port), or a complete
+        address (IP:port).  The parameter can be specified multiple times.
+        It will cause any listener configured on such an address to be
+        skipped during boot.
+      </para>
+    </listitem>
+  </varlistentry>
   <varlistentry><term><option>-c</option></term>
     <listitem>
       <para>
@@ -105,6 +113,12 @@
         Instructs <command>stratcond</command> to run in the foreground.
         The process remains attached to the terminal.  This is primarily
         for debugging purposes.
+      </para>
+      <para>
+        If this flag is specified more than once, <command>stratcond</command>
+        stay in the foreground, but the foreground process will actually
+        be the monitor process and the child will be forked off and
+        respawned on unexpected failures.
       </para>
     </listitem>
   </varlistentry>

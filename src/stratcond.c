@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007-2010, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,7 +31,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
+#include <mtev_defines.h>
+#include "noit_version.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -40,19 +42,25 @@
 #include <fcntl.h>
 #include <limits.h>
 
-#include "eventer/eventer.h"
-#include "utils/noit_log.h"
-#include "utils/noit_hash.h"
-#include "utils/noit_security.h"
-#include "utils/noit_watchdog.h"
-#include "utils/noit_lockfile.h"
-#include "noit_main.h"
-#include "noit_listener.h"
-#include "noit_console.h"
+#include <eventer/eventer.h>
+#include <mtev_memory.h>
+#include <mtev_log.h>
+#include <mtev_hash.h>
+#include <mtev_security.h>
+#include <mtev_watchdog.h>
+#include <mtev_lockfile.h>
+#include <mtev_main.h>
+#include <mtev_listener.h>
+#include <mtev_console.h>
+#include <mtev_conf.h>
+#include <mtev_rest.h>
+#include <mtev_reverse_socket.h>
+#include <mtev_events_rest.h>
+#include <mtev_capabilities_listener.h>
+
+#include "noit_mtev_bridge.h"
+#include "noit_config.h"
 #include "noit_module.h"
-#include "noit_conf.h"
-#include "noit_rest.h"
-#include "noit_capabilities_listener.h"
 #include "stratcon_jlog_streamer.h"
 #include "stratcon_datastore.h"
 #include "stratcon_iep.h"
@@ -83,7 +91,7 @@ static void usage(const char *progname) {
 
 void parse_clargs(int argc, char **argv) {
   int c;
-  while((c = getopt(argc, argv, "Mrshc:dDu:g:t:l:L:G:")) != EOF) {
+  while((c = getopt(argc, argv, "Mrshc:dDu:g:n:t:l:L:G:")) != EOF) {
     switch(c) {
       case 'M':
         strict_module_load = 1;
@@ -92,10 +100,26 @@ void parse_clargs(int argc, char **argv) {
         glider = strdup(optarg);
         break;
       case 'l':
-        noit_main_enable_log(optarg);
+        mtev_main_enable_log(optarg);
         break;
       case 'L':
-        noit_main_disable_log(optarg);
+        mtev_main_disable_log(optarg);
+        break;
+      case 'n':
+        {
+          char *cp = strchr(optarg, ':');
+          if(!cp) mtev_listener_skip(optarg, 0);
+          else {
+            if(cp == optarg) {
+              *cp++ = '\0';
+              mtev_listener_skip(NULL, atoi(cp));
+            }
+            else {
+              *cp++ = '\0';
+              mtev_listener_skip(optarg, atoi(cp));
+            }
+          }
+        }
         break;
       case 'r':
         stratcon_iep_set_enabled(0);
@@ -123,7 +147,7 @@ void parse_clargs(int argc, char **argv) {
         debug++;
         break;
       case 'D':
-        foreground = 1;
+        foreground++;
         break;
       default:
         break;
@@ -134,70 +158,82 @@ void parse_clargs(int argc, char **argv) {
 static
 int configure_eventer() {
   int rv = 0;
-  noit_hash_table *table;
-  table = noit_conf_get_hash(NULL, "/" APPNAME "/eventer/config");
+  mtev_hash_table *table;
+  table = mtev_conf_get_hash(NULL, "/" APPNAME "/eventer/config");
   if(table) {
-    noit_hash_iter iter = NOIT_HASH_ITER_ZERO;
+    mtev_hash_iter iter = MTEV_HASH_ITER_ZERO;
     const char *key, *value;
     int klen;
-    while(noit_hash_next_str(table, &iter, &key, &klen, &value)) {
+    while(mtev_hash_next_str(table, &iter, &key, &klen, &value)) {
       int subrv;
       if((subrv = eventer_propset(key, value)) != 0)
         rv = subrv;
     }
-    noit_hash_destroy(table, free, free);
+    mtev_hash_destroy(table, free, free);
     free(table);
   }
   return rv;
 }
 
+const char *reverse_prefix = "noit/"; /* namespace out connections */
+const char *reverse_prefix_cns[] = { "noit/", NULL };
+
 static int child_main() {
   char conf_str[1024];
+  char stratcon_version[80];
 
-  noit_watchdog_child_heartbeat();
+  mtev_watchdog_child_heartbeat();
 
   /* Next (re)load the configs */
-  if(noit_conf_load(config_file) == -1) {
+  if(mtev_conf_load(config_file) == -1) {
     fprintf(stderr, "Cannot load config: '%s'\n", config_file);
     exit(2);
   }
 
-  noit_log_reopen_all();
+  mtev_log_reopen_all();
+  mtevL(noit_notice, "process starting: %d\n", (int)getpid());
+  mtev_log_go_asynch();
 
   /* Lastly, run through all other system inits */
-  if(!noit_conf_get_stringbuf(NULL, "/" APPNAME "/eventer/@implementation",
+  if(!mtev_conf_get_stringbuf(NULL, "/" APPNAME "/eventer/@implementation",
                               conf_str, sizeof(conf_str))) {
-    noitL(noit_stderr, "Cannot find '%s' in configuration\n",
+    mtevL(noit_stderr, "Cannot find '%s' in configuration\n",
           "/" APPNAME "/eventer/@implementation");
     exit(2);
   }
   if(eventer_choose(conf_str) == -1) {
-    noitL(noit_stderr, "Cannot choose eventer %s\n", conf_str);
+    mtevL(noit_stderr, "Cannot choose eventer %s\n", conf_str);
     exit(2);
   }
   if(configure_eventer() != 0) {
-    noitL(noit_stderr, "Cannot configure eventer\n");
+    mtevL(noit_stderr, "Cannot configure eventer\n");
     exit(2);
   }
   if(eventer_init() == -1) {
-    noitL(noit_stderr, "Cannot init eventer %s\n", conf_str);
+    mtevL(noit_stderr, "Cannot init eventer %s\n", conf_str);
     exit(2);
   }
   /* rotation init requires, eventer_init() */
-  noit_conf_log_init_rotate(APPNAME, noit_false);
+  mtev_conf_log_init_rotate(APPNAME, mtev_false);
 
-  noit_watchdog_child_eventer_heartbeat();
+  mtev_watchdog_child_eventer_heartbeat();
 
-  noit_console_init(APPNAME);
-  noit_console_conf_init();
-  noit_http_rest_init();
+  mtev_console_init(APPNAME);
+  mtev_console_conf_init();
+  mtev_http_rest_init();
+  mtev_reverse_socket_init(reverse_prefix, reverse_prefix_cns);
+  mtev_reverse_socket_acl(mtev_reverse_socket_denier);
+  mtev_events_rest_init();
   stratcon_realtime_http_init(APPNAME);
-  noit_capabilities_listener_init();
-  noit_listener_init(APPNAME);
+  mtev_capabilities_listener_init();
+  noit_build_version(stratcon_version, sizeof(stratcon_version));
+  mtev_capabilities_add_feature("stratcon", stratcon_version);
+  mtev_listener_init(APPNAME);
 
-  noit_module_init();
-  if(strict_module_load && noit_module_load_failures() > 0) {
-    noitL(noit_stderr, "Failed to load some modules and -M given.\n");
+  mtev_dso_init();
+  mtev_dso_post_init();
+  if(strict_module_load && mtev_dso_load_failures() > 0) {
+    mtevL(noit_stderr, "Failed to load some modules and -M given.\n");
     exit(2);
   }
 
@@ -205,14 +241,7 @@ static int child_main() {
     stratcon_datastore_init();
 
   /* Drop privileges */
-  if(chrootpath && noit_security_chroot(chrootpath)) {
-    noitL(noit_stderr, "Failed to chroot(), exiting.\n");
-    exit(-1);
-  }
-  if(noit_security_usergroup(droptouser, droptogroup, noit_false)) {
-    noitL(noit_stderr, "Failed to drop privileges, exiting.\n");
-    exit(-1);
-  }
+  mtev_conf_security_init(APPNAME, droptouser, droptogroup, chrootpath);
 
   stratcon_jlog_streamer_init(APPNAME);
 
@@ -221,19 +250,22 @@ static int child_main() {
   if(stratcon_datastore_get_enabled()) {
     /* Write our log out, and setup a watchdog to write it out on change. */
     stratcon_datastore_saveconfig(NULL);
-    noit_conf_coalesce_changes(10); /* 10 seconds of no changes before we write */
+    mtev_conf_coalesce_changes(10); /* 10 seconds of no changes before we write */
   }
   else
-    noit_conf_coalesce_changes(INT_MAX);
+    mtev_conf_coalesce_changes(INT_MAX);
 
-  noit_conf_watch_and_journal_watchdog(stratcon_datastore_saveconfig, NULL);
+  mtev_conf_watch_and_journal_watchdog(stratcon_datastore_saveconfig, NULL);
 
   eventer_loop();
   return 0;
 }
 
 int main(int argc, char **argv) {
+  noit_mtev_bridge_init();
+  mtev_memory_init();
   parse_clargs(argc, argv);
-  return noit_main(APPNAME, config_file, debug, foreground,
-                   glider, droptouser, droptogroup, child_main);
+  return mtev_main(APPNAME, config_file, debug, foreground,
+                   MTEV_LOCK_OP_LOCK, glider, droptouser, droptogroup,
+                   child_main);
 }

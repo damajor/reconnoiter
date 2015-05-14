@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<section>
+<section xmlns="http://docbook.org/ns/docbook" version="5">
   <title>external</title>
   <para>The external module performs checks via external processes like more traditional monitoring systems.  While this approach is far less efficient and does not scale well on a single system, it provides easier transition from existing monitoring systems.  Checks should exit normally with an exit status of 0 for success, 1 or 2 for failure and 3 for unknown.  Exiting with a status of 3 is highly discouraged.  The standard output is provided as the status of the check.</para>
   <variablelist>
@@ -59,6 +59,62 @@
             </varlistentry>
           </variablelist>
           <para>The group under which the external checks should be executed.</para>
+        </listitem>
+      </varlistentry>
+    </variablelist>
+    <variablelist>
+      <varlistentry>
+        <term>path</term>
+        <listitem>
+          <variablelist>
+            <varlistentry>
+              <term>required</term>
+              <listitem>
+                <para>optional</para>
+              </listitem>
+            </varlistentry>
+            <varlistentry>
+              <term>default</term>
+              <listitem>
+                <para>/</para>
+              </listitem>
+            </varlistentry>
+            <varlistentry>
+              <term>allowed</term>
+              <listitem>
+                <para>.+</para>
+              </listitem>
+            </varlistentry>
+          </variablelist>
+          <para>The path under which all external commands to be executed will be located. Commands outside of this path will not be executed.</para>
+        </listitem>
+      </varlistentry>
+    </variablelist>
+    <variablelist>
+      <varlistentry>
+        <term>nagios_regex</term>
+        <listitem>
+          <variablelist>
+            <varlistentry>
+              <term>required</term>
+              <listitem>
+                <para>optional</para>
+              </listitem>
+            </varlistentry>
+            <varlistentry>
+              <term>default</term>
+              <listitem>
+                <para>\'?(?&lt;key&gt;[^'=\s]+)\'?=(?&lt;value&gt;-?[0-9]+(\.[0-9]+)?)(?&lt;uom&gt;[a-zA-Z%]+)?(?=[;,\s])</para>
+              </listitem>
+            </varlistentry>
+            <varlistentry>
+              <term>allowed</term>
+              <listitem>
+                <para>.+</para>
+              </listitem>
+            </varlistentry>
+          </variablelist>
+          <para>The default regular expression with which to parse Nagios data. Named values are "key", "value", and "uom" (unit of measurement)</para>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -171,15 +227,17 @@
               </listitem>
             </varlistentry>
           </variablelist>
-          <para>This is a regular expression that is globally applied to the stdout of the command.  Each match is turned into a metric. It is a requirement to used named capturing in the regular expression where "key" is the named match of the metric name and "value" is the named match for the matric value.  A sample for extracting performance data from Nagios commands would be: (?&lt;key&gt;\S+)=(?&lt;value&gt;[^;\s]+)(?=[;\s])</para>
+          <para>This is a regular expression that is globally applied to the stdout of the command.  Each match is turned into a metric. It is a requirement to used named capturing in the regular expression where "key" is the named match of the metric name and "value" is the named match for the matric value.  A sample for extracting performance data from Nagios commands would be: (?&lt;key&gt;\S+)=(?&lt;value&gt;[^;\s]+)(?=[;\s]). "NAGIOS" may also be specified as a value, which will configure the external check to do Nagios parsing based on the nagios_regex module configuration parameter.</para>
         </listitem>
       </varlistentry>
     </variablelist>
   </section>
-  <example>
-    <title>Checking a service via the /path/to/check_foo command.</title>
-    <para>The hypothetical check_foo command takes a target host with the -H parameter, runs a check and returns its health via exit code and stdout. We set the environment variable QUUX to the value BAZ.  The check is against host 10.10.2.2.</para>
-    <programlisting>
+  <section>
+    <title>Examples</title>
+    <example>
+      <title>Checking a service via the /path/to/check_foo command.</title>
+      <para>The hypothetical check_foo command takes a target host with the -H parameter, runs a check and returns its health via exit code and stdout. We set the environment variable QUUX to the value BAZ.  The check is against host 10.10.2.2.</para>
+      <programlisting>
       &lt;noit&gt;
         &lt;modules&gt;
           &lt;module image="external" name="external"/&gt;
@@ -197,5 +255,6 @@
         &lt;/checks&gt;
       &lt;/noit&gt;
       </programlisting>
-  </example>
+    </example>
+  </section>
 </section>

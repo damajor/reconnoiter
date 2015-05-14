@@ -45,8 +45,8 @@ function onload(image)
                allowed=".+">Specifies the EHLO parameter.</parameter>
     <parameter name="from" required="optional" default=""
                allowed=".+">Specifies the envelope sender.</parameter>
-    <parameter name="to" required="required"
-               allowed=".+">Specifies the envelope recipient.</parameter>
+    <parameter name="to" required="optional"
+               allowed=".+">Specifies the envelope recipient, if blank issue quit.</parameter>
     <parameter name="payload" required="optional" default="Subject: Testing"
                allowed=".+">Specifies the payload sent (on the wire). CR LF DOT CR LF is appended automatically.</parameter>
     <parameter name="starttls" required="optional" default="false"
@@ -122,6 +122,9 @@ local function read_cmd(e)
   final_status, out = 0, ""
   repeat
     local str = e:read("\r\n")
+    if not str then
+      return 421, "[internal error]"
+    end
     local status, c, message = string.match(str, "^(%d+)([-%s])(.+)$")
     if not status then
       return 421, "[internal error]"
@@ -142,13 +145,18 @@ local function write_cmd(e, cmd)
 end
 
 local function mkaction(e, check)
-  return function (phase, tosend, expected_code)
+  return function (phase, tosend, expected_code, track)
     local start_time = noit.timeval.now()
     local success = true
     if tosend then
       write_cmd(e, tosend)
     end
     local actual_code, message = read_cmd(e)
+    if track then
+      check.metric_string("last_cmd", phase)
+      check.metric_string("last_code", actual_code)
+      check.metric_string("last_message", message and string.gsub(message, "[\r\n]+$", "") or nil)
+    end
     if expected_code ~= actual_code then
       check.status(string.format("%d/%d %s", expected_code, actual_code, message))
       check.bad()
@@ -253,10 +261,44 @@ local function mk_saslplain(e, check)
   end
 end
 
+function ex_actions(action, check, config, mailfrom, rcptto, payload)
+  local status = ''
+  -- Only proceed if from is present, empty or not
+  if config.from == "" or config.from then
+   if not action("mailfrom", mailfrom, 250, true) then
+     return status
+   end
+  else
+   return status
+  end
+
+  if config.to then
+    if not action("rcptto", rcptto, 250, true) then
+      return status
+    end
+  else
+    return status
+  end
+
+  -- Since the way the protocol works, the to address may be in the payload...
+  if payload then
+    if action("data", "DATA", 354, true) then
+      if action("body", payload .. "\r\n.", 250, true) then
+        status = ',sent'
+      else
+        status = ',unsent'
+      end
+    end
+  end
+  return status
+end
+
 function initiate(module, check)
+  local config = check.interpolate(check.config)
   local starttime = noit.timeval.now()
   local e = noit.socket(check.target_ip)
-  local rv, err = e:connect(check.target_ip, check.config.port or 25)
+  local rv, err = e:connect(check.target_ip, config.port or 25)
+  local action_result
   check.unavailable()
 
   if rv ~= 0 then
@@ -265,32 +307,46 @@ function initiate(module, check)
     return
   end
 
-  local try_starttls = check.config.starttls == "true" or check.config.starttls == "on"
+  local try_starttls = config.starttls == "true" or config.starttls == "on"
   local good = true
-  local ehlo = string.format("EHLO %s", check.config.ehlo or "noit.local")
-  local mailfrom = string.format("MAIL FROM:<%s>", check.config.from or "")
-  local rcptto = string.format("RCPT TO:<%s>", check.config.to)
-  local payload = check.config.payload or "Subject: Test\n\nHello."
+  local ehlo = string.format("EHLO %s", config.ehlo or "noit.local")
+  local mailfrom = string.format("MAIL FROM:<%s>", config.from or "")
+  local rcptto = string.format("RCPT TO:<%s>", config.to or "")
+  local payload = config.payload or "Subject: Test\n\nHello."
   payload = payload:gsub("\n", "\r\n")
   local status = 'connected'
   local action = mkaction(e, check)
   local sasl_login = mk_sasllogin(e, check)
   local sasl_plain = mk_saslplain(e, check)
 
-  if     not action("banner", nil, 220)
-      or not action("ehlo", ehlo, 250) then return end
+  -- setup SSL info
+  local default_ca_chain =
+      noit.conf_get_string("/noit/eventer/config/default_ca_chain")
+  local certfile = config.certificate_file or ''
+  local keyfile = config.key_file or ''
+  local cachain = config.ca_chain or default_ca_chain
+  local ciphers = config.ciphers or ''
+
+  if     not action("banner", nil, 220, true)
+      or not action("ehlo", ehlo, 250, true) then return end
 
   if try_starttls then
-    local starttls  = action("starttls", "STARTTLS", 220)
-    e:ssl_upgrade_socket(check.config.certificate_file, check.config.key_file,
-                         check.config.ca_chain, check.config.ciphers)
-
+    local starttls  = action("starttls", "STARTTLS", 220, true)
+    if not starttls then
+      check.unavailable()
+      check.status("Could not start TLS for this target")
+      return
+    end
+    e:ssl_upgrade_socket(certfile, keyfile, cachain, ciphers)
     local ssl_ctx = e:ssl_ctx()
     if ssl_ctx ~= nil then
       if ssl_ctx.error ~= nil then status = status .. ',sslerror' end
       check.metric_string("cert_error", ssl_ctx.error)
       check.metric_string("cert_issuer", ssl_ctx.issuer)
       check.metric_string("cert_subject", ssl_ctx.subject)
+      if ssl_ctx.san_list ~= nil then
+        check.metric_string("cert_subject_alternative_names", ssl_ctx.san_list)
+      end
       check.metric_uint32("cert_start", ssl_ctx.start_time)
       check.metric_uint32("cert_end", ssl_ctx.end_time)
       check.metric_int32("cert_end_in", ssl_ctx.end_time - os.time())
@@ -300,27 +356,23 @@ function initiate(module, check)
       end
     end
 
-    if not action("ehlo", ehlo, 250) then return end
+    if not action("ehlo", ehlo, 250, true) then return end
   end
 
-  if check.config.sasl_authentication ~= nil then
-    if check.config.sasl_authentication == "login" then
-      sasl_login(noit.base64_encode(check.config.sasl_user or ""), noit.base64_encode(check.config.sasl_password or ""))
-    elseif check.config.sasl_authentication == "plain" then
-      sasl_plain(noit.base64_encode((check.config.sasl_auth_id or "") .. "\0" .. (check.config.sasl_user or "") .. "\0" .. (check.config.sasl_password or "")))
+  if config.sasl_authentication ~= nil then
+    if config.sasl_authentication == "login" then
+      sasl_login(noit.base64_encode(config.sasl_user or ""), noit.base64_encode(config.sasl_password or ""))
+    elseif config.sasl_authentication == "plain" then
+      sasl_plain(noit.base64_encode((config.sasl_auth_id or "") .. "\0" .. (config.sasl_user or "") .. "\0" .. (config.sasl_password or "")))
     end
   end
 
-  if     action("mailfrom", mailfrom, 250)
-     and action("rcptto", rcptto, 250)
-     and action("data", "DATA", 354)
-     and action("body", payload .. "\r\n.", 250)
-     and action("quit", "QUIT", 221)
-  then
-    status = status .. ',sent'
-  else
-    return
-  end
+  action_result = ex_actions(action, check, config, mailfrom, rcptto, payload)
+  -- Always issue quit
+  action("quit", "QUIT", 221, false)
+
+  status = status .. action_result
+
   check.status(status)
   if good then check.good() end
 

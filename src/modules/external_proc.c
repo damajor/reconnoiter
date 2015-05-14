@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,7 +31,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
+#include <mtev_defines.h>
+
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -42,13 +44,14 @@
 #include <sys/wait.h>
 #endif
 
-#include "utils/noit_skiplist.h"
-#include "utils/noit_log.h"
+#include <mtev_skiplist.h>
+
+#include "noit_mtev_bridge.h"
 #include "external_proc.h"
 
 static void finish_procs();
-static noit_log_stream_t nlerr = NULL;
-static noit_log_stream_t nldeb = NULL;
+static mtev_log_stream_t nlerr = NULL;
+static mtev_log_stream_t nldeb = NULL;
 int in_fd, out_fd;
 
 struct proc_state {
@@ -61,6 +64,7 @@ struct proc_state {
   char **envp;
   int stdout_fd;
   int stderr_fd;
+  struct proc_state *next;
 };
 
 void proc_state_free(struct proc_state *ps) {
@@ -76,8 +80,8 @@ void proc_state_free(struct proc_state *ps) {
   if(ps->stderr_fd >= 0) close(ps->stderr_fd);
 }
 
-noit_skiplist active_procs;
-noit_skiplist done_procs;
+mtev_skiplist active_procs;
+mtev_skiplist done_procs;
 
 static int __proc_state_check_no(const void *av, const void *bv) {
   struct proc_state *a = (struct proc_state *)av;
@@ -109,25 +113,30 @@ static int __proc_state_pid_key(const void *akv, const void *bv) {
   return 1;
 }
 
-static void external_sigchld(int sig) {
-  noit_skiplist_node *iter = NULL;
+static void process_siglist() {
+  mtev_skiplist_node *iter = NULL;
   struct proc_state *ps;
-  int status = 0;
   pid_t pid;
-  pid = waitpid(0, &status, WNOHANG);
-  ps = noit_skiplist_find_compare(&active_procs, &pid, &iter, __proc_state_pid);
-  noitL(nldeb, "reaped pid %d (check: %lld) -> %x\n",
-        pid, (long long int)(ps?ps->check_no:-1), status);
-  if(ps) {
-    ps->status = status;
-    noit_skiplist_remove_compare(&active_procs, &pid, NULL,  __proc_state_pid);
-    noit_skiplist_insert(&done_procs, ps);
+  while(1) {
+    int status = 0;
+    pid = waitpid(0, &status, WNOHANG);
+    if(pid <= 0) break;
+    ps = mtev_skiplist_find_compare(&active_procs, &pid, &iter, __proc_state_pid);
+    mtevL((ps?nldeb:nlerr), "reaped pid %d (check: %lld) -> %x\n",
+          pid, (long long int)(ps?ps->check_no:-1), status);
+    if(ps) {
+      int rv = mtev_skiplist_remove_compare(&active_procs, &ps->pid, NULL,  __proc_state_pid);
+      if (!rv) {
+        mtevL(noit_error, "error: couldn't remove PID %d from active_procs in external\n", ps->pid);
+      }
+      mtev_skiplist_insert(&done_procs, ps);
+    }
   }
 }
 
 static void fetch_and_kill_by_check(int64_t check_no) {
   struct proc_state *ps;
-  ps = noit_skiplist_find(&active_procs, &check_no, NULL);
+  ps = mtev_skiplist_find(&active_procs, &check_no, NULL);
   if(ps) {
     ps->cancelled = 1;
     kill(ps->pid, SIGKILL);
@@ -136,14 +145,49 @@ static void fetch_and_kill_by_check(int64_t check_no) {
 
 #define assert_read(fd, d, l) do { \
   int len; \
-  while((len = read(fd,d,l)) == -1 && errno == EINTR) finish_procs(); \
-  assert(len == l); \
-} while(0)
+  int read_bytes = 0; \
+  if (l == 0) break; \
+  while (1) { \
+    len = read(fd,(char*)d+read_bytes,l); \
+    if (len == -1) { \
+      if (errno == EINTR) { \
+        finish_procs(); \
+      } \
+      else break; \
+    } \
+    else if (len == 0) { \
+      break; \
+    } \
+    else { \
+      read_bytes += len; \
+      if (read_bytes >= l) break; \
+    } \
+  } \
+  assert(read_bytes == l); \
+} while (0)
+
 #define assert_write(fd, s, l) do { \
   int len; \
-  while((len = write(fd,s,l)) == -1 && errno == EINTR) finish_procs(); \
-  assert(len == l); \
-} while(0)
+  int written_bytes = 0; \
+  if (l == 0) break; \
+  while (1) { \
+    len = write(fd,(char*)s+written_bytes,l); \
+    if (len == -1) { \
+      if (errno == EINTR) { \
+        finish_procs(); \
+      } \
+      else break; \
+    } \
+    else if (len == 0) { \
+      break; \
+    } \
+    else { \
+      written_bytes += len; \
+      if (written_bytes >= l) break; \
+    } \
+  } \
+  assert(written_bytes == l); \
+} while (0)
 
 int write_out_backing_fd(int ofd, int bfd) {
   char *mmap_buf;
@@ -151,19 +195,19 @@ int write_out_backing_fd(int ofd, int bfd) {
   struct stat buf;
 
   if(fstat(bfd, &buf) == -1) {
-    noitL(nldeb, "external: fstat error: %s\n", strerror(errno));
+    mtevL(nldeb, "external: fstat error: %s\n", strerror(errno));
     goto bail;
   }
   /* Our output length is limited to 64k (including a \0) */
   /* So, we'll limit the mapping of the file to 0xfffe */
   if(buf.st_size > 0xfffe) outlen = 0xfffe;
-  outlen = buf.st_size & 0xffff;
+  else outlen = buf.st_size & 0xffff;
   /* If we have no length, we can skip all this nonsense */
   if(outlen == 0) goto bail;
 
   mmap_buf = mmap(NULL, outlen, PROT_READ, MAP_SHARED, bfd, 0);
   if(mmap_buf == (char *)-1) {
-    noitL(nldeb, "external: mmap error: %s\n", strerror(errno));
+    mtevL(nldeb, "external: mmap error: %s\n", strerror(errno));
     goto bail;
   }
   outlen++; /* no null on the end, but we're reporting one */
@@ -183,9 +227,10 @@ int write_out_backing_fd(int ofd, int bfd) {
 
 static void finish_procs() {
   struct proc_state *ps;
-  noitL(noit_error, "%d done procs to cleanup\n", done_procs.size);
-  while((ps = noit_skiplist_pop(&done_procs, NULL)) != NULL) {
-    noitL(noit_error, "finished %lld/%d\n", (long long int)ps->check_no, ps->pid);
+  process_siglist();
+  mtevL(noit_debug, "%d done procs to cleanup\n", done_procs.size);
+  while((ps = mtev_skiplist_pop(&done_procs, NULL)) != NULL) {
+    mtevL(noit_debug, "finished %lld/%d\n", (long long int)ps->check_no, ps->pid);
     if(ps->cancelled == 0) {
       assert_write(out_fd, &ps->check_no,
                    sizeof(ps->check_no));
@@ -203,7 +248,7 @@ int external_proc_spawn(struct proc_state *ps) {
   char stdoutfile[PATH_MAX];
   char stderrfile[PATH_MAX];
 
-  noitL(nldeb, "About to spawn: (%s)\n", ps->path);
+  mtevL(nldeb, "About to spawn: (%s)\n", ps->path);
   strlcpy(stdoutfile, "/tmp/noitext.XXXXXX", PATH_MAX);
   ps->stdout_fd = mkstemp(stdoutfile);
   if(ps->stdout_fd < 0) goto prefork_fail;
@@ -217,7 +262,7 @@ int external_proc_spawn(struct proc_state *ps) {
 
   /* Here.. fork has succeeded */
   if(ps->pid) {
-    noit_skiplist_insert(&active_procs, ps);
+    mtev_skiplist_insert(&active_procs, ps);
     return 0;
   }
   /* Run the process */
@@ -232,8 +277,12 @@ int external_proc_spawn(struct proc_state *ps) {
   exit(-1);
  prefork_fail:
   ps->status = -1;
-  noit_skiplist_insert(&done_procs, ps);
+  mtev_skiplist_insert(&done_procs, ps);
   return -1;
+}
+
+static void sig_noop(int signum) {
+  signal(signum, sig_noop);
 }
 
 int external_child(external_data_t *data) {
@@ -244,18 +293,17 @@ int external_child(external_data_t *data) {
 
   /* switch to / */
   if(chdir("/") != 0) {
-    noitL(noit_error, "Failed chdir(\"/\"): %s\n", strerror(errno));
+    mtevL(noit_error, "Failed chdir(\"/\"): %s\n", strerror(errno));
     return -1;
   }
 
-  signal(SIGCHLD, external_sigchld);
-  noit_skiplist_init(&active_procs);
-  noit_skiplist_set_compare(&active_procs, __proc_state_check_no,
+  mtev_skiplist_init(&active_procs);
+  mtev_skiplist_set_compare(&active_procs, __proc_state_check_no,
                             __proc_state_check_no_key);
-  noit_skiplist_add_index(&active_procs, __proc_state_pid,
+  mtev_skiplist_add_index(&active_procs, __proc_state_pid,
                           __proc_state_pid_key);
-  noit_skiplist_init(&done_procs);
-  noit_skiplist_set_compare(&done_procs, __proc_state_check_no,
+  mtev_skiplist_init(&done_procs);
+  mtev_skiplist_set_compare(&done_procs, __proc_state_check_no,
                             __proc_state_check_no_key);
 
   while(1) {
@@ -264,6 +312,8 @@ int external_child(external_data_t *data) {
     int64_t check_no;
     int16_t argcnt, *arglens, envcnt, *envlens;
     int i;
+
+    sig_noop(SIGCHLD);
 
     /* We poll here so that we can be interrupted by the SIGCHLD */
     pfd.fd = in_fd;
@@ -284,12 +334,14 @@ int external_child(external_data_t *data) {
     proc_state->check_no = check_no;
 
     /* read in the argument lengths */
-    arglens = malloc(argcnt * sizeof(*arglens));
+    arglens = calloc(argcnt, sizeof(*arglens));
     assert_read(in_fd, arglens, argcnt * sizeof(*arglens));
     /* first string is the path, second is the first argv[0] */
     /* we need to allocate argcnt + 1 (NULL), but the first is path */
     proc_state->argv = malloc(argcnt * sizeof(*proc_state->argv));
     /* read each string, first in path, second into argv[0], ... */
+    /* arglens[i] comes from the parent, so we should trust it */
+    /* coverity[tainted_data] */
     proc_state->path = malloc(arglens[0]);
     assert_read(in_fd, proc_state->path, arglens[0]);
     for(i=0; i<argcnt-1; i++) {
@@ -301,7 +353,7 @@ int external_child(external_data_t *data) {
 
     /* similar thing with envp, but no path trickery */
     assert_read(in_fd, &envcnt, sizeof(envcnt));
-    envlens = malloc(envcnt * sizeof(*envlens));
+    envlens = calloc(envcnt, sizeof(*envlens));
     assert_read(in_fd, envlens, envcnt * sizeof(*envlens));
     proc_state->envp = malloc((envcnt+1) * sizeof(*proc_state->envp));
     for(i=0; i<envcnt; i++) {

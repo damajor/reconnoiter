@@ -30,12 +30,16 @@
 
 module(..., package.seeall)
 
+local HttpClient = require 'noit.HttpClient'
+local helpers = {}
+
 function onload(image)
   image.xml_description([=[
 <module>
   <name>resmon</name>
   <description><para>The resmon module performs services checks against an HTTP server serving with Resmon XML or JSON.</para>
-  <para><ulink url="https://labs.omniti.com/trac/resmon"><citetitle>Resmon</citetitle></ulink> is a light-weight resource monitor that exposes health of services over HTTP in XML.</para>
+  <para><link xmlns:xlink="http://www.w3.org/1999/xlink"
+      xlink:href="https://labs.omniti.com/trac/resmon"><citetitle>Resmon</citetitle></link> is a light-weight resource monitor that exposes health of services over HTTP in XML.</para>
   <para>This module rides on the http module and provides a secondary phase of XML parsing on the contents that extracts Resmon status messages into metrics that can be trended.</para>
   </description>
   <loader>lua</loader>
@@ -47,6 +51,46 @@ function onload(image)
     <parameter name="port"
                required="optional"
                allowed="\d+">The TCP port can be specified to overide the default of 81.</parameter>
+    <parameter name="method"
+               required="optional"
+               default="GET"
+               allowed=".+">The HTTP method to use.</parameter>
+    <parameter name="payload"
+               required="optional"
+               default=""
+               allowed=".*">The optional HTTP payload to send with the request.</parameter>
+    <parameter name="http_version"
+               required="optional"
+               default="1.1"
+               allowed="^(\d+\.\d+)?$">Sets the HTTP version for the check to use.</parameter>
+    <parameter name="auth_method"
+               required="optional"
+               allowed="^(?:Basic|Digest|Auto)$">HTTP Authentication method to use.</parameter>
+    <parameter name="auth_user"
+               required="optional"
+               allowed="[^:]*">The user to authenticate as.</parameter>
+    <parameter name="auth_password"
+               required="optional"
+               allowed=".*">The password to use during authentication.</parameter>
+    <parameter name="ca_chain"
+               required="optional"
+               allowed=".+">A path to a file containing all the certificate authorities that should be loaded to validate the remote certificate (for SSL checks).</parameter>
+    <parameter name="certificate_file"
+               required="optional"
+               allowed=".+">A path to a file containing the client certificate that will be presented to the remote server (for SSL checks).</parameter>
+    <parameter name="key_file"
+               required="optional"
+               allowed=".+">A path to a file containing key to be used in conjunction with the cilent certificate (for SSL checks).</parameter>
+    <parameter name="ciphers"
+               required="optional"
+               allowed=".+">A list of ciphers to be used in the SSL protocol (for SSL checks).</parameter>
+    <parameter name="read_limit"
+               required="optional"
+               default="0"
+               allowed="\d+">Sets an approximate limit on the data read (0 means no limit).</parameter>
+    <parameter name="header_(\S+)"
+               required="optional"
+               allowed=".+">Allows the setting of arbitrary HTTP headers in the request.</parameter>
   </checkconfig>
   <examples>
     <example>
@@ -76,6 +120,15 @@ function onload(image)
   </examples>
 </module>
 ]=]);
+
+  if image.name() == "resmon" then return 0 end
+  local helper = {} 
+  local status, err = pcall(function () helper = require ('noit.module.resmon.' .. image.name()) end)
+  if not status and (err == nil or string.find(err, "not found") == nil) then
+    noit.log("error", "lua require('noit.module.resmon.%s') -> %s\n", image.name(), err or "unknown error")
+    return 0
+  end
+  helpers[image.name()] = helper
   return 0
 end
 
@@ -86,8 +139,6 @@ end
 function config(module, options)
   return 0
 end
-
-local HttpClient = require 'noit.HttpClient'
 
 function set_check_metric(check, name, type, value)
     if type == 'i' then
@@ -188,20 +239,23 @@ function xml_to_metrics(check, doc)
 end
 
 function initiate(module, check)
-    local url = check.config.url or 'http:///'
-    local schema, host, uri = string.match(url, "^(https?)://([^/]*)(.+)$");
+    local reverse_str = "reverse:check/" .. check.uuid
+    local config = check.interpolate(check.config)
+    local helper = helpers[module.name()]
+    if helper and helper.fix_config then config = helper.fix_config(config) end
+    local url = config.url or 'http:///'
+    local schema, host, uri = string.match(url, "^(https?)://([^/]*)(.*)$");
+    local method = config.method or "GET"
+    local http_version = config.http_version
+    local payload = config.payload
+    if payload == "" then payload = nil end
     local port
     local use_ssl = false
-    local codere = noit.pcre(check.config.code or '^200$')
+    local codere = noit.pcre(config.code or '^200$')
     local good = false
     local starttime = noit.timeval.now()
-
-    local user = check.config.auth_user or nil
-    local pass = check.config.auth_password or nil
-    local encoded = nil
-    if (user ~= nil and pass ~= nil) then
-        encoded = noit.base64_encode(user .. ':' .. pass)
-    end
+    local read_limit = tonumber(config.read_limit) or nil
+    local client
 
     -- assume the worst.
     check.bad()
@@ -210,12 +264,14 @@ function initiate(module, check)
     if host == nil then host = check.target end
     if schema == nil then
         schema = 'http'
+    end
+    if uri == nil or uri == '' then
         uri = '/'
     end
     if schema == 'http' then
-        port = check.config.port or 81
+        port = config.port or 81
     elseif schema == 'https' then
-        port = check.config.port or 443
+        port = config.port or 443
         use_ssl = true
     else
         error(schema .. " not supported")
@@ -228,22 +284,113 @@ function initiate(module, check)
     local hdrs_in = { }
     callbacks.consume = function (str) output = output .. str end
     callbacks.headers = function (t) hdrs_in = t end
-    local client = HttpClient:new(callbacks)
-    local rv, err = client:connect(check.target_ip, port, use_ssl)
+
+    -- setup SSL info
+    local default_ca_chain =
+        noit.conf_get_string("/noit/eventer/config/default_ca_chain")
+    callbacks.certfile = function () return config.certificate_file end
+    callbacks.keyfile = function () return config.key_file end
+    callbacks.cachain = function ()
+        return config.ca_chain and config.ca_chain
+                                      or default_ca_chain
+    end
+    callbacks.ciphers = function () return config.ciphers end
    
+    -- perform the request
+    local rv, err
+    local headers = {}
+    headers.Host = host
+    for header, value in pairs(config) do
+        hdr = string.match(header, '^header_(.+)$')
+        if hdr ~= nil then
+          headers[hdr] = value
+        end
+    end
+    headers['X-Reconnoiter-Period'] = check.period
+
+    if config.auth_method == "Basic" or
+        (config.auth_method == nil and
+            config.auth_user ~= nil and config.auth_user ~= "" and
+            config.auth_password ~= nil) then
+        local user = config.auth_user or nil
+        local pass = config.auth_password or nil
+        local encoded = nil
+        if (user ~= nil and pass ~= nil) then
+            encoded = noit.base64_encode(user .. ':' .. pass)
+            headers["Authorization"] = "Basic " .. encoded
+        end
+    elseif config.auth_method == "Digest" or
+           config.auth_method == "Auto" then
+
+        -- this is handled later as we need our challenge.
+        client = HttpClient:new(callbacks)
+        rv, err = client:connect(reverse_str, port, use_ssl)
+        if rv ~= 0 then
+            rv, err = client:connect(check.target_ip, port, use_ssl)
+        end
+        if rv ~= 0 then
+            check.status(str or "unknown error")
+            return
+        end
+        local headers_firstpass = {}
+        for k,v in pairs(headers) do
+            headers_firstpass[k] = v
+        end
+        client:do_request(method, uri, headers_firstpass, payload, http_version)
+        client:get_response(read_limit)
+
+        -- if we got a 200 here, we needed no auth
+        if client.code == 200 then goto done_request end
+
+        -- not success.. clear what callbacks created
+        hdrs_in = {}
+        output = ''
+
+        if client.code ~= 401 or
+           client.headers["www-authenticate"] == nil then
+            check.status("expected digest challenge, got " .. client.code)
+            return
+        end
+        local user = config.auth_user or ''
+        local password = config.auth_password or ''
+        local ameth, challenge =
+            string.match(client.headers["www-authenticate"], '^(%S+)%s+(.+)$')
+        if config.auth_method == "Auto" and ameth == "Basic" then
+            local encoded = noit.base64_encode(user .. ':' .. password)
+            headers["Authorization"] = "Basic " .. encoded
+        elseif ameth == "Digest" then
+            headers["Authorization"] =
+                "Digest " .. client:auth_digest("GET", uri,
+                                         user, password, challenge)
+        else
+            check.status("Unexpected auth '" .. ameth .. "' in challenge")
+            return
+        end
+    elseif config.auth_method ~= nil then
+        check.status("Unknown auth method: " .. config.auth_method)
+        return
+    end
+
+    client = HttpClient:new(callbacks)
+    rv, err = client:connect(reverse_str, port, use_ssl)
+    if rv ~= 0 then
+        rv, err = client:connect(check.target_ip, port, use_ssl)
+    end
     if rv ~= 0 then
         check.status(err or "unknown error")
         return
     end
 
-    -- perform the request
-    local headers = {}
-    headers.Host = host
-    if encoded ~= nil then
-        headers["Authorization"] = "Basic " .. encoded
+    client:do_request(method, uri, headers, payload, http_version)
+    client:get_response(read_limit)
+
+::done_request::
+    if helper and helper.fix_output then output = helper.fix_output(output) end
+
+    if helper and helper.process then
+      helper.process(check, output)
+      return
     end
-    client:do_request("GET", uri, headers)
-    client:get_response()
 
     local jsondoc = nil
     if string.find(hdrs_in["content-type"] or '', 'json') ~= nil or

@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,26 +31,27 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
-#include "dtrace_probes.h"
+#include <mtev_defines.h>
+#include <mtev_str.h>
+#include <mtev_json.h>
+
+#include "noit_mtev_bridge.h"
+#include "noit_dtrace_probes.h"
 #include "noit_check_tools.h"
 #include "noit_check_tools_shared.h"
-#include "utils/noit_str.h"
-#include "json-lib/json.h"
 
 #include <assert.h>
 
-NOIT_HOOK_IMPL(check_preflight,
+MTEV_HOOK_IMPL(check_preflight,
   (noit_module_t *self, noit_check_t *check, noit_check_t *cause),
   void *, closure,
   (void *closure, noit_module_t *self, noit_check_t *check, noit_check_t *cause),
   (closure,self,check,cause))
-NOIT_HOOK_IMPL(check_postflight,
+MTEV_HOOK_IMPL(check_postflight,
   (noit_module_t *self, noit_check_t *check, noit_check_t *cause),
   void *, closure,
   (void *closure, noit_module_t *self, noit_check_t *check, noit_check_t *cause),
   (closure,self,check,cause))
-
 
 typedef struct {
   noit_module_t *self;
@@ -58,16 +60,34 @@ typedef struct {
   dispatch_func_t dispatch;
 } recur_closure_t;
 
+static void
+noit_check_recur_name_details(char *buf, int buflen,
+                              eventer_t e, void *closure) {
+  char id_str[UUID_STR_LEN+1];
+  recur_closure_t *rcl = e ? e->closure : NULL;
+  if(!e) {
+    snprintf(buf, buflen, "noit_check_recur_handler");
+    return;
+  }
+  uuid_unparse_lower(rcl->check->checkid, id_str);
+  snprintf(buf, buflen, "fire(%s)", id_str);
+  return;
+}
 static int
 noit_check_recur_handler(eventer_t e, int mask, void *closure,
                               struct timeval *now) {
   recur_closure_t *rcl = closure;
-  rcl->check->fire_event = NULL; /* This is us, we get free post-return */
+  int ms;
+
+  if(e != rcl->check->fire_event) return 0;
+
   noit_check_resolve(rcl->check);
-  noit_check_schedule_next(rcl->self, &e->whence, rcl->check, now,
-                           rcl->dispatch, NULL);
+  ms = noit_check_schedule_next(rcl->self, NULL, rcl->check, now,
+                                rcl->dispatch, NULL);
+  if(ms == 0)
+    rcl->check->fire_event = NULL; /* This is us, we get free post-return */
   if(NOIT_CHECK_RESOLVED(rcl->check)) {
-    if(NOIT_HOOK_CONTINUE ==
+    if(MTEV_HOOK_CONTINUE ==
        check_preflight_hook_invoke(rcl->self, rcl->check, rcl->cause)) {
       if(NOIT_CHECK_DISPATCH_ENABLED()) {
         char id[UUID_STR_LEN+1];
@@ -75,12 +95,15 @@ noit_check_recur_handler(eventer_t e, int mask, void *closure,
         NOIT_CHECK_DISPATCH(id, rcl->check->module, rcl->check->name,
                             rcl->check->target);
       }
+      if(ms < rcl->check->timeout && !(rcl->check->flags & NP_TRANSIENT))
+        mtevL(noit_error, "%s might not finish in %dms (timeout %dms)\n",
+              rcl->check->name, ms, rcl->check->timeout);
       rcl->dispatch(rcl->self, rcl->check, rcl->cause);
     }
     check_postflight_hook_invoke(rcl->self, rcl->check, rcl->cause);
   }
   else
-    noitL(noit_debug, "skipping %s`%s`%s, unresolved\n",
+    mtevL(noit_debug, "skipping %s`%s`%s, unresolved\n",
           rcl->check->target, rcl->check->module, rcl->check->name);
   free(rcl);
   return 0;
@@ -92,14 +115,23 @@ noit_check_schedule_next(noit_module_t *self,
                          struct timeval *now, dispatch_func_t dispatch,
                          noit_check_t *cause) {
   eventer_t newe;
-  struct timeval period, earliest;
+  struct timeval period, earliest, diff;
+  int64_t diffms, periodms, offsetms;
   recur_closure_t *rcl;
+  int initial = last_check ? 1 : 0;
 
   assert(cause == NULL);
-  assert(check->fire_event == NULL);
   if(check->period == 0) return 0;
+
+  /* if last_check is not passed, we use the initial_schedule_time
+   * otherwise, we set the initial_schedule_time
+   */
+  if(!last_check) last_check = &check->initial_schedule_time;
+  else memcpy(&check->initial_schedule_time, last_check, sizeof(*last_check));
+
   if(NOIT_CHECK_DISABLED(check) || NOIT_CHECK_KILLED(check)) {
     if(!(check->flags & NP_TRANSIENT)) check_slots_dec_tv(last_check);
+    memset(&check->initial_schedule_time, 0, sizeof(struct timeval));
     return 0;
   }
 
@@ -113,9 +145,11 @@ noit_check_schedule_next(noit_module_t *self,
 
   /* If the check is unconfigured and needs resolving, we'll set the
    * period down a bit lower so we can pick up the resolution quickly.
+   * The one exception is if this is the initial run.
    */
-  if(!NOIT_CHECK_RESOLVED(check) && NOIT_CHECK_SHOULD_RESOLVE(check) &&
-      check->period > 1000) {
+  if(!initial &&
+     !NOIT_CHECK_RESOLVED(check) && NOIT_CHECK_SHOULD_RESOLVE(check) &&
+     check->period > 1000) {
     period.tv_sec = 1;
     period.tv_usec = 0;
   }
@@ -123,12 +157,30 @@ noit_check_schedule_next(noit_module_t *self,
     period.tv_sec = check->period / 1000;
     period.tv_usec = (check->period % 1000) * 1000;
   }
+  periodms = period.tv_sec * 1000 + period.tv_usec / 1000;
 
   newe = eventer_alloc();
+  /* calculate the differnet between the initial schedule time and "now" */
+  if(compare_timeval(earliest, *last_check) >= 0) {
+    sub_timeval(earliest, *last_check, &diff);
+    diffms = (int64_t)diff.tv_sec * 1000 + diff.tv_usec / 1000;
+  }
+  else {
+    mtevL(noit_error, "time is going backwards. abort.\n");
+    abort();
+  }
+  /* determine the offset from initial schedule time that would place
+   * us at the next period-aligned point past "now" */
+  offsetms = ((diffms / periodms) + 1) * periodms;
+  diff.tv_sec = offsetms / 1000;
+  diff.tv_usec = (offsetms % 1000) * 1000;
+
   memcpy(&newe->whence, last_check, sizeof(*last_check));
-  add_timeval(newe->whence, period, &newe->whence);
-  if(compare_timeval(newe->whence, earliest) < 0)
-    memcpy(&newe->whence, &earliest, sizeof(earliest));
+  add_timeval(newe->whence, diff, &newe->whence);
+
+  sub_timeval(newe->whence, earliest, &diff);
+  diffms = (int64_t)diff.tv_sec * 1000 + (int)diff.tv_usec / 1000;
+  assert(compare_timeval(newe->whence, earliest) > 0);
   newe->mask = EVENTER_TIMER;
   newe->callback = noit_check_recur_handler;
   rcl = calloc(1, sizeof(*rcl));
@@ -138,9 +190,13 @@ noit_check_schedule_next(noit_module_t *self,
   rcl->dispatch = dispatch;
   newe->closure = rcl;
 
-  eventer_add(newe);
+  /* knuth's golden ratio approach */
+  if(!self->thread_unsafe) {
+    newe->thr_owner = CHOOSE_EVENTER_THREAD_FOR_CHECK(check);
+  }
   check->fire_event = newe;
-  return 0;
+  eventer_add(newe);
+  return diffms;
 }
 
 void
@@ -169,11 +225,14 @@ noit_check_run_full_asynch(noit_check_t *check, eventer_func_t callback) {
 void
 noit_check_tools_init() {
   noit_check_tools_shared_init();
-  eventer_name_callback("noit_check_recur_handler", noit_check_recur_handler);
+  eventer_name_callback_ext("noit_check_recur_handler",
+                            noit_check_recur_handler,
+                            noit_check_recur_name_details, NULL);
 }
 
 static int
-populate_stats_from_resmon_formatted_json(stats_t *s, struct json_object *o,
+populate_stats_from_resmon_formatted_json(noit_check_t *check,
+                                          struct json_object *o,
                                           const char *prefix) {
   int count = 0;
   char keybuff[256];
@@ -183,7 +242,7 @@ populate_stats_from_resmon_formatted_json(stats_t *s, struct json_object *o,
 } while(0)
   if(o == NULL) {
     if(prefix) {
-      noit_stats_set_metric(s, prefix, METRIC_STRING, NULL);
+      noit_stats_set_metric(check, prefix, METRIC_STRING, NULL);
       count++;
     }
     return count;
@@ -196,42 +255,60 @@ populate_stats_from_resmon_formatted_json(stats_t *s, struct json_object *o,
       for(i=0;i<alen;i++) {
         struct json_object *item = json_object_array_get_idx(o, i);
         MKKEY("%d", i);
-        count += populate_stats_from_resmon_formatted_json(s, item, keybuff);
+        count += populate_stats_from_resmon_formatted_json(check, item, keybuff);
       }
     }
     break;
     case json_type_object:
     {
-      struct lh_table *lh;
-      struct lh_entry *el;
+      struct jl_lh_table *lh;
+      struct jl_lh_entry *el;
       struct json_object *has_type = NULL, *has_value = NULL;
       lh = json_object_get_object(o);
-      lh_foreach(lh, el) {
+      jl_lh_foreach(lh, el) {
         if(!strcmp(el->k, "_type")) has_type = (struct json_object *)el->v;
         else if(!strcmp(el->k, "_value")) has_value = (struct json_object *)el->v;
         else {
           struct json_object *item = (struct json_object *)el->v;
           MKKEY("%s", (const char *)el->k);
-          count += populate_stats_from_resmon_formatted_json(s, item, keybuff);
+          count += populate_stats_from_resmon_formatted_json(check, item, keybuff);
         }
       }
-      if(prefix && has_type && has_value &&
-         json_object_is_type(has_type, json_type_string) &&
-         json_object_is_type(has_value, json_type_string)) {
+      if(prefix && has_type &&
+         json_object_is_type(has_type, json_type_string)) {
         const char *type_str = json_object_get_string(has_type);
-        const char *value_str = json_object_get_string(has_value);
-        switch(*type_str) {
-          case METRIC_INT32:
-          case METRIC_UINT32:
-          case METRIC_INT64:
-          case METRIC_UINT64:
-          case METRIC_DOUBLE:
-          case METRIC_STRING:
-            noit_stats_set_metric_coerce(s, prefix,
-                                         (metric_type_t)*type_str, value_str);
-            count++;
-          default:
-            break;
+
+#define COERCE_JSON_OBJECT(type, item) do { \
+  const char *value_str = NULL; \
+  if(json_object_is_type(item, json_type_string)) \
+    value_str = json_object_get_string(item); \
+  else if(!json_object_is_type(item, json_type_null)) \
+    value_str = json_object_to_json_string(item); \
+  switch(type) { \
+    case METRIC_INT32: case METRIC_UINT32: case METRIC_INT64: \
+    case METRIC_UINT64: case METRIC_DOUBLE: case METRIC_STRING: \
+      noit_stats_set_metric_coerce(check, prefix, \
+                                   (metric_type_t)type, value_str); \
+      count++; \
+    default: \
+      break; \
+  } \
+} while(0)
+
+
+        if (has_value == NULL) {
+          noit_stats_set_metric_coerce(check, prefix, (metric_type_t)*type_str, NULL);
+          count++;
+        }
+        else if(json_object_is_type(has_value, json_type_array)) {
+          int i, alen = json_object_array_length(has_value);
+          for(i=0;i<alen;i++) {
+            struct json_object *item = json_object_array_get_idx(has_value, i);
+            COERCE_JSON_OBJECT(*type_str, item);
+          }
+        }
+        else {
+          COERCE_JSON_OBJECT(*type_str, has_value);
         }
       }
       break;
@@ -240,7 +317,7 @@ populate_stats_from_resmon_formatted_json(stats_t *s, struct json_object *o,
     /* directs */
     case json_type_string:
       if(prefix) {
-        noit_stats_set_metric(s, prefix, METRIC_GUESS,
+        noit_stats_set_metric(check, prefix, METRIC_GUESS,
                               (char *)json_object_get_string(o));
         count++;
       }
@@ -248,20 +325,20 @@ populate_stats_from_resmon_formatted_json(stats_t *s, struct json_object *o,
     case json_type_boolean:
       if(prefix) {
         int val = json_object_get_boolean(o) ? 1 : 0;
-        noit_stats_set_metric(s, prefix, METRIC_INT32, &val);
+        noit_stats_set_metric(check, prefix, METRIC_INT32, &val);
         count++;
       }
       break;
     case json_type_null:
       if(prefix) {
-        noit_stats_set_metric(s, prefix, METRIC_STRING, NULL);
+        noit_stats_set_metric(check, prefix, METRIC_STRING, NULL);
         count++;
       }
       break;
     case json_type_double:
       if(prefix) {
         double val = json_object_get_double(o);
-        noit_stats_set_metric(s, prefix, METRIC_DOUBLE, &val);
+        noit_stats_set_metric(check, prefix, METRIC_DOUBLE, &val);
         count++;
       }
       break;
@@ -272,17 +349,17 @@ populate_stats_from_resmon_formatted_json(stats_t *s, struct json_object *o,
         switch(json_object_get_int_overflow(o)) {
           case json_overflow_int:
             i64 = json_object_get_int(o);
-            noit_stats_set_metric(s, prefix, METRIC_INT64, &i64);
+            noit_stats_set_metric(check, prefix, METRIC_INT64, &i64);
             count++;
             break;
           case json_overflow_int64:
             i64 = json_object_get_int64(o);
-            noit_stats_set_metric(s, prefix, METRIC_INT64, &i64);
+            noit_stats_set_metric(check, prefix, METRIC_INT64, &i64);
             count++;
             break;
           case json_overflow_uint64:
             u64 = json_object_get_uint64(o);
-            noit_stats_set_metric(s, prefix, METRIC_UINT64, &u64);
+            noit_stats_set_metric(check, prefix, METRIC_UINT64, &u64);
             count++;
             break;
         }
@@ -291,14 +368,24 @@ populate_stats_from_resmon_formatted_json(stats_t *s, struct json_object *o,
   return count;
 }
 int
-noit_check_stats_from_json_str(stats_t *s, const char *json_str, int len) {
+noit_check_stats_from_json_str(noit_check_t *check,
+                               const char *json_str, int len) {
   int rv = -1;
   struct json_tokener *tok = NULL;
   struct json_object *root = NULL;
   tok = json_tokener_new();
   root = json_tokener_parse_ex(tok, json_str, len);
-  if(root) rv = populate_stats_from_resmon_formatted_json(s, root, NULL);
+  if(root) rv = populate_stats_from_resmon_formatted_json(check, root, NULL);
   if(tok) json_tokener_free(tok);
   if(root) json_object_put(root);
   return rv;
+}
+
+void
+noit_check_make_attrs(noit_check_t *check, mtev_hash_table *attrs) {
+#define CA_STORE(a,b) mtev_hash_store(attrs, a, strlen(a), b)
+  CA_STORE("target", check->target);
+  CA_STORE("target_ip", check->target_ip);
+  CA_STORE("name", check->name);
+  CA_STORE("module", check->module);
 }

@@ -35,7 +35,8 @@ function onload(image)
 <module>
   <name>jezebel</name>
   <description><para>The jezebel module performs services checks against jezebel and simplifies its special-case Resmon output.</para>
-  <para><ulink url="https://labs.omniti.com/trac/resmon"><citetitle>Resmon</citetitle></ulink> is a light-weight resource monitor that exposes health of services over HTTP in XML.</para>
+  <para><link xmlns:xlink="http://www.w3.org/1999/xlink"
+      xlink:href="https://labs.omniti.com/trac/resmon"><citetitle>Resmon</citetitle></link> is a light-weight resource monitor that exposes health of services over HTTP in XML.</para>
   <para>This module rides on the http module and provides a secondary phase of XML parsing on the contents that extracts Resmon status messages into metrics that can be trended.</para>
   </description>
   <loader>lua</loader>
@@ -43,10 +44,7 @@ function onload(image)
   <moduleconfig>
     <parameter name="url"
                required="required"
-               allowed=".+">The URL including schema and hostname (as you would type into a browser's location bar).</parameter>
-    <parameter name="port"
-               required="optional"
-               allowed="\d+">The TCP port can be specified to overide the default of 81.</parameter>
+               allowed=".+">A comma-separated list of URLs including schema, hostname, and port (as you would type into a browser's location bar).</parameter>
   </moduleconfig>
   <checkconfig>
     <parameter name=".+" required="optional" allowed=".*">All check config values are passed through to jezebel for execution.</parameter>
@@ -83,14 +81,35 @@ function onload(image)
   return 0
 end
 
+local snmp = require("snmp")
+
 function init(module)
+  snmp.init_snmp()
   return 0
 end
 
 local configs = {}
+local count = {}
+local urls = {}
+local current_url = {}
 
 function config(module, options)
-  configs[module.name()] = options
+  local name = module.name()
+  configs[name] = options
+  urls[name] = {}
+  count[name] = 0
+  current_url[name] = 0
+  urls[name][0] = "test"
+  if (options.url) then
+    local url_split = noit.extras.split(options.url, ",")
+    for index, url in ipairs(url_split) do
+      urls[name][count[name]] = url
+      count[name]=count[name]+1
+    end
+  else
+    urls[name][0] = 'http:///';
+    count[name]=count[name]+1
+  end
   return 0
 end
 
@@ -108,15 +127,41 @@ function constructXml(check)
   root:attr("period", check.period)
   root:attr("timeout", check.timeout)
   local config = root:addchild("config")
-  for key, value in pairs(check.config) do
-    config:addchild(key):contents(value)
+  if check.module == "snmp" then
+    for key, value in pairs(check.config) do
+      value = check.interpolate(value):gsub("^%s*(.-)%s*$", "%1")
+      if key == "walk" then
+        if string.find(value, "^%d") then
+          value = "." .. value
+        end
+        local converted = snmp.convert_mib(value)
+        config:addchild("walk"):contents(converted)
+      elseif string.sub(key, 1, 4) == "oid_" then
+        if string.find(value, "^%d") then
+          value = "." .. value
+        end
+        local converted = snmp.convert_mib(value)
+        -- we want to add even if there's an error
+        -- since we want to preserve the name of
+        -- the metric
+        config:addchild(key):contents(converted)
+      else
+        config:addchild(key):contents(value)
+      end
+    end
+  else
+    for key, value in pairs(check.config) do
+      config:addchild(key):contents(value)
+    end
   end
   return doc:tostring()
 end
 
 function initiate(module, check)
-    local options = configs[module.name()]
-    local url = options.url or 'http:///'
+    local name = module.name()
+    local options = configs[name]
+    local url = urls[name][current_url[name]]
+    current_url[name] = (current_url[name] + 1) % count[name]
     url = url .. '/' .. module.name()
     local schema, host, port, uri =
         string.match(url, "^(https?)://([^/:]*):?([0-9]*)(.+)$");

@@ -67,6 +67,9 @@ SL checks).</parameter>
     <parameter name="ciphers"
                required="optional"
                allowed=".+">A list of ciphers to be used in the SSL protocol (for SSL checks).</parameter>
+    <parameter name="header_Host"
+               required="optional"
+               allowed=".+">The host header to validate against the SSL certificate (for SSL checks).</parameter>
   </checkconfig>
   <examples>
     <example>
@@ -144,24 +147,26 @@ function issue_cmd(e, tok, str)
       table.insert(t,p1.." "..p2)
       return p1, t, bad
     end
-    o,eidx,p1 = line:find("\*%s+(.+)")
+    o,eidx,p1 = line:find("%*%s+(.+)")
     if o == 1 then table.insert(t,p1) else table.insert(bad,line) end
   end
   return nil, t, bad
 end
 
 function initiate(module, check)
+  local config = check.interpolate(check.config)
   local starttime = noit.timeval.now()
-  local folder = check.config.folder or 'INBOX'
+  local folder = config.folder or 'INBOX'
   check.bad()
   check.unavailable()
   check.status("unknown error")
-  local port = check.config.port
+  local port = config.port
   local good = false
   local status = ""
   local use_ssl = false
   local _tok = 0
   local last_msg = 0
+  local host_header = config.header_Host or ''
 
   if check.target_ip == nil then
     check.status("dns resolution failure")
@@ -174,7 +179,7 @@ function initiate(module, check)
   end
 
   -- SSL
-  if check.config.use_ssl == "true" or check.config.use_ssl == "on" then
+  if config.use_ssl == "true" or config.use_ssl == "on" then
     use_ssl = true
   end
 
@@ -190,11 +195,18 @@ function initiate(module, check)
     return
   end
 
+  local ca_chain = 
+     noit.conf_get_string("/noit/eventer/config/default_ca_chain")
+
+  if config.ca_chain ~= nil and config.ca_chain ~= '' then
+    ca_chain = config.ca_chain
+  end
+
   if use_ssl == true then
-    rv, err = e:ssl_upgrade_socket(check.config.certificate_file,
-                                        check.config.key_file,
-                                        check.config.ca_chain,
-                                        check.config.ciphers)
+    rv, err = e:ssl_upgrade_socket(config.certificate_file,
+                                        config.key_file,
+                                        ca_chain,
+                                        config.ciphers)
   end 
 
   local connecttime = noit.timeval.now()
@@ -211,10 +223,23 @@ function initiate(module, check)
   -- ssl metrics
   local ssl_ctx = e:ssl_ctx()
   if ssl_ctx ~= nil then
+    local header_match_error = nil
+    if host_header ~= '' then
+      header_match_error = noit.extras.check_host_header_against_certificate(host_header, ssl_ctx.subject, ssl_ctx.san_list)
+    end
     if ssl_ctx.error ~= nil then status = status .. ',sslerror' end
-    check.metric_string("cert_error", ssl_ctx.error)
+    if header_match_error == nil then
+      check.metric_string("cert_error", ssl_ctx.error)
+    elseif ssl_ctx.error == nil then
+      check.metric_string("cert_error", header_match_error)
+    else
+      check.metric_string("cert_error", ssl_ctx.error .. ', ' .. header_match_error)
+    end
     check.metric_string("cert_issuer", ssl_ctx.issuer)
     check.metric_string("cert_subject", ssl_ctx.subject)
+    if ssl_ctx.san_list ~= nil then
+      check.metric_string("cert_subject_alternative_names", ssl_ctx.san_list)
+    end
     check.metric_uint32("cert_start", ssl_ctx.start_time)
     check.metric_uint32("cert_end", ssl_ctx.end_time)
     if noit.timeval.seconds(starttime) > ssl_ctx.end_time then
@@ -238,8 +263,8 @@ function initiate(module, check)
   -- login
   local lstart = noit.timeval.now()
   state, lines, errors = issue_cmd(e, tok(), "LOGIN " ..
-                                             check.config.auth_user .. " " ..
-                                             check.config.auth_password)
+                                             config.auth_user .. " " ..
+                                             config.auth_password)
   elapsed(check, "login`duration", lstart, noit.timeval.now())
   check.metric_string("login`status", lines[ # lines ])
   if state ~= "OK" then good = false
@@ -264,9 +289,9 @@ function initiate(module, check)
     end
   end
 
-  if check.config.search ~= nil then
+  if config.search ~= nil then
     last_msg = nil
-    local search = check.config.search:gsub("[\r\n]", "")
+    local search = config.search:gsub("[\r\n]", "")
     local sstart = noit.timeval.now()
     state, lines, errors = issue_cmd(e, tok(), "SEARCH " .. search)
     elapsed(check, "search`duration", sstart, noit.timeval.now())
@@ -286,8 +311,8 @@ function initiate(module, check)
     end
   end
 
-  if check.config.fetch ~= nil and
-     (check.config.fetch == "true" or check.config.fetch == "on") and
+  if config.fetch ~= nil and
+     (config.fetch == "true" or config.fetch == "on") and
      last_msg ~= nil and
      last_msg > 0 then
     local fstart = noit.timeval.now()

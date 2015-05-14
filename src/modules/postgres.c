@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007-2010, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,21 +31,21 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
+#include <mtev_defines.h>
 
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
 #include <assert.h>
 #include <math.h>
+#include <libpq-fe.h>
+
+#include <mtev_hash.h>
 
 #include "noit_module.h"
 #include "noit_check.h"
 #include "noit_check_tools.h"
-#include "utils/noit_log.h"
-#include "utils/noit_hash.h"
-
-#include <libpq-fe.h>
+#include "noit_mtev_bridge.h"
 
 /* Ripped from postgres 8.3.3 */
 #ifndef BOOLOID
@@ -72,7 +73,6 @@
 typedef struct {
   noit_module_t *self;
   noit_check_t *check;
-  stats_t current;
   PGconn *conn;
   PGresult *result;
   int rv;
@@ -80,13 +80,13 @@ typedef struct {
   double *connect_duration;
   double query_duration_d;
   double *query_duration;
-  noit_hash_table attrs;
+  mtev_hash_table attrs;
   int timed_out;
   char *error;
 } postgres_check_info_t;
 
-static noit_log_stream_t nlerr = NULL;
-static noit_log_stream_t nldeb = NULL;
+static mtev_log_stream_t nlerr = NULL;
+static mtev_log_stream_t nldeb = NULL;
 
 static void postgres_cleanup(noit_module_t *self, noit_check_t *check) {
   postgres_check_info_t *ci = check->closure;
@@ -104,9 +104,9 @@ static void postgres_ingest_stats(postgres_check_info_t *ci) {
     int nrows, ncols, i, j;
     nrows = PQntuples(ci->result);
     ncols = PQnfields(ci->result);
-    noit_stats_set_metric(&ci->current, "row_count", METRIC_INT32, &nrows);
+    noit_stats_set_metric(ci->check, "row_count", METRIC_INT32, &nrows);
     for (i=0; i<nrows; i++) {
-      noitL(nldeb, "postgres: row %d [%d cols]:\n", i, ncols);
+      mtevL(nldeb, "postgres: row %d [%d cols]:\n", i, ncols);
       if(ncols<2) continue;
       if(PQgetisnull(ci->result, i, 0)) continue;
       for (j=1; j<ncols; j++) {
@@ -120,7 +120,7 @@ static void postgres_ingest_stats(postgres_check_info_t *ci) {
         snprintf(mname, sizeof(mname), "%s`%s",
                  PQgetvalue(ci->result, i, 0), PQfname(ci->result, j));
         coltype = PQftype(ci->result, j);
-        noitL(nldeb, "postgres:   col %d (%s) type %d: %s\n", j, mname, coltype,
+        mtevL(nldeb, "postgres:   col %d (%s) type %d: %s\n", j, mname, coltype,
               PQgetisnull(ci->result, i, j) ? "[[null]]" : PQgetvalue(ci->result, i, j));
         switch(coltype) {
           case BOOLOID:
@@ -129,7 +129,7 @@ static void postgres_ingest_stats(postgres_check_info_t *ci) {
               iv = strcmp(PQgetvalue(ci->result, i, j), "f") ? 1 : 0;
               piv = &iv;
             }
-            noit_stats_set_metric(&ci->current, mname, METRIC_INT32, piv);
+            noit_stats_set_metric(ci->check, mname, METRIC_INT32, piv);
             break;
           case INT2OID:
           case INT4OID:
@@ -139,7 +139,7 @@ static void postgres_ingest_stats(postgres_check_info_t *ci) {
               lv = strtoll(PQgetvalue(ci->result, i, j), NULL, 10);
               plv = &lv;
             }
-            noit_stats_set_metric(&ci->current, mname, METRIC_INT64, plv);
+            noit_stats_set_metric(ci->check, mname, METRIC_INT64, plv);
             break;
           case FLOAT4OID:
           case FLOAT8OID:
@@ -149,12 +149,12 @@ static void postgres_ingest_stats(postgres_check_info_t *ci) {
               dv = atof(PQgetvalue(ci->result, i, j));
               pdv = &dv;
             }
-            noit_stats_set_metric(&ci->current, mname, METRIC_DOUBLE, pdv);
+            noit_stats_set_metric(ci->check, mname, METRIC_DOUBLE, pdv);
             break;
           default:
             if(PQgetisnull(ci->result, i, j)) sv = NULL;
             else sv = PQgetvalue(ci->result, i, j);
-            noit_stats_set_metric(&ci->current, mname, METRIC_GUESS, sv);
+            noit_stats_set_metric(ci->check, mname, METRIC_GUESS, sv);
             break;
         }
       }
@@ -162,39 +162,40 @@ static void postgres_ingest_stats(postgres_check_info_t *ci) {
   }
 }
 static void postgres_log_results(noit_module_t *self, noit_check_t *check) {
-  struct timeval duration;
+  struct timeval duration, now;
   postgres_check_info_t *ci = check->closure;
 
-  gettimeofday(&ci->current.whence, NULL);
-  sub_timeval(ci->current.whence, check->last_fire_time, &duration);
-  ci->current.duration = duration.tv_sec * 1000 + duration.tv_usec / 1000;
-  ci->current.available = NP_UNAVAILABLE;
-  ci->current.state = NP_BAD;
+  gettimeofday(&now, NULL);
+  sub_timeval(now, check->last_fire_time, &duration);
+  noit_stats_set_whence(ci->check, &now);
+  noit_stats_set_duration(ci->check, duration.tv_sec * 1000 + duration.tv_usec / 1000);
+  noit_stats_set_available(ci->check, NP_UNAVAILABLE);
+  noit_stats_set_state(ci->check, NP_BAD);
   if(ci->connect_duration)
-    noit_stats_set_metric(&ci->current, "connect_duration", METRIC_DOUBLE,
+    noit_stats_set_metric(ci->check, "connect_duration", METRIC_DOUBLE,
                           ci->connect_duration);
   if(ci->query_duration)
-    noit_stats_set_metric(&ci->current, "query_duration", METRIC_DOUBLE,
+    noit_stats_set_metric(ci->check, "query_duration", METRIC_DOUBLE,
                           ci->query_duration);
-  if(ci->error) ci->current.status = ci->error;
-  else if(ci->timed_out) ci->current.status = "timeout";
+  if(ci->error) noit_stats_set_status(ci->check, ci->error);
+  else if(ci->timed_out) noit_stats_set_status(ci->check, "timeout");
   else if(ci->rv == PGRES_COMMAND_OK) {
-    ci->current.available = NP_AVAILABLE;
-    ci->current.state = NP_GOOD;
-    ci->current.status = "command ok";
+    noit_stats_set_available(ci->check, NP_AVAILABLE);
+    noit_stats_set_state(ci->check, NP_GOOD);
+    noit_stats_set_status(ci->check, "command ok");
   }
   else if(ci->rv == PGRES_TUPLES_OK) {
-    ci->current.available = NP_AVAILABLE;
-    ci->current.state = NP_GOOD;
-    ci->current.status = "tuples ok";
+    noit_stats_set_available(ci->check, NP_AVAILABLE);
+    noit_stats_set_state(ci->check, NP_GOOD);
+    noit_stats_set_status(ci->check, "tuples ok");
   }
-  else ci->current.status = "internal error";
+  else noit_stats_set_status(ci->check, "internal error");
 
-  noit_check_set_stats(self, check, &ci->current);
+  noit_check_set_stats(check);
 }
 
 #define FETCH_CONFIG_OR(key, str) do { \
-  if(!noit_hash_retr_str(check->config, #key, strlen(#key), &key)) \
+  if(!mtev_hash_retr_str(check->config, #key, strlen(#key), &key)) \
     key = str; \
 } while(0)
 
@@ -229,7 +230,6 @@ static int postgres_drive_session(eventer_t e, int mask, void *closure,
 
   switch(mask) {
     case EVENTER_ASYNCH_WORK:
-      noit_check_stats_clear(&ci->current);
       ci->connect_duration = NULL;
       ci->query_duration = NULL;
 
@@ -295,7 +295,7 @@ static int postgres_initiate(noit_module_t *self, noit_check_t *check,
   struct timeval __now;
 
   /* We cannot be running */
-  assert(!(check->flags & NP_RUNNING));
+  BAIL_ON_RUNNING_CHECK(check);
   check->flags |= NP_RUNNING;
 
   ci->self = self;
@@ -319,9 +319,9 @@ static int postgres_initiate_check(noit_module_t *self, noit_check_t *check,
   return 0;
 }
 
-static int postgres_onload(noit_image_t *self) {
-  nlerr = noit_log_stream_find("error/postgres");
-  nldeb = noit_log_stream_find("debug/postgres");
+static int postgres_onload(mtev_image_t *self) {
+  nlerr = mtev_log_stream_find("error/postgres");
+  nldeb = mtev_log_stream_find("debug/postgres");
   if(!nlerr) nlerr = noit_stderr;
   if(!nldeb) nldeb = noit_debug;
 
@@ -332,12 +332,12 @@ static int postgres_onload(noit_image_t *self) {
 #include "postgres.xmlh"
 noit_module_t postgres = {
   {
-    NOIT_MODULE_MAGIC,
-    NOIT_MODULE_ABI_VERSION,
-    "postgres",
-    "PostgreSQL Checker",
-    postgres_xml_description,
-    postgres_onload
+    .magic = NOIT_MODULE_MAGIC,
+    .version = NOIT_MODULE_ABI_VERSION,
+    .name = "postgres",
+    .description = "PostgreSQL Checker",
+    .xml_description = postgres_xml_description,
+    .onload = postgres_onload
   },
   NULL,
   NULL,

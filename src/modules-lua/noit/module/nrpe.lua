@@ -43,6 +43,7 @@ function onload(image)
                allowed="\d+">Specifies the port on which the management interface can be reached.</parameter>
     <parameter name="use_ssl" required="optional" allowed="^(?:true|false|on|off)$" default="true">Upgrade TCP connection to use SSL.</parameter>
     <parameter name="command" required="required" allowed=".+">Command to run on the remote node.</parameter>
+    <parameter name="append_uom" required="optional" allowed="(?:true|false|on|off)">If the value comes back with a unit of measure, append it to the metric name.</parameter>
   </checkconfig>
   <examples>
     <example>
@@ -95,6 +96,7 @@ function v2_packet(cmd)
 end
 
 function initiate(module, check)
+  local config = check.interpolate(check.config)
   local starttime = noit.timeval.now()
   local max_len = 80
   check.bad()
@@ -103,20 +105,26 @@ function initiate(module, check)
   local good = false
   local status = ""
   local use_ssl = true
+  local append_uom = true
   local port = 5666
 
-  if check.config.port ~= nil then
-    port = check.config.port
+  if config.port ~= nil then
+    port = config.port
   end
 
-  if check.config.command == nil then
+  if config.command == nil then
     check.status("no command")
     return
   end
 
   -- SSL
-  if check.config.use_ssl == "false" or check.config.use_ssl == "off" then
+  if config.use_ssl == "false" or config.use_ssl == "off" then
     use_ssl = false
+  end
+
+  -- Append Unit of Measure to metric name
+  if config.append_uom == "false" or config.append_uom == "off" then
+    append_uom = false
   end
 
   local e = noit.socket(check.target_ip)
@@ -145,7 +153,7 @@ function initiate(module, check)
   check.available()
 
   -- run the command
-  local packet = v2_packet(check.config.command)
+  local packet = v2_packet(config.command)
   e:write(packet)
   local response = e:read(1036)
   if response == nil or response:len() ~= 1036 then
@@ -162,23 +170,40 @@ function initiate(module, check)
 
   local result = response:sub(cnt):gsub("%z", "")
 
-  local state = result:match("^(%w+)")
-  if state == "OK" then good = true end
+  local state = result:match("^([%w%s]+)")
+  if string.match(state, "OK") then good = true end
   check.metric_string("state", state)
 
-  local message = result:match("^%w+ %- ([^|]+)")
+  local message = result:match("^([^|]+)")
   check.metric_string("message", message)
 
-  local metrics = result:match("|(.+)$")
+  local metrics = result:match("|%s(.+)$")
   if metrics ~= nil then
-    -- /(?<key>\S+)=(?<value>[^;\s]+)(?=[;\s])/g
-    local exre = noit.pcre('(\\S+)=([^;\\s]+)(?=[;\\s])')
-    local rv = true
-    while rv do
-      rv, m, key, value = exre(metrics)
-      if rv and key ~= nil then
-        check.metric(key, value)
+    local lcnt = 0;
+    local pdata = 0;
+    -- /'?(?<key>[^'=]+)'?=(?<value>[\-0-9\.]+)(?<uom>[a-zA-Z%]+)(?=[;\s])/g
+
+    for line in metrics:gmatch("[^\r\n]+") do
+      if lcnt ~= 0 and pdata == 0 then
+        local idx = line:find("|")
+        if idx ~= nil then
+          line = line:sub(idx+2)
+          pdata = 1
+        end
       end
+
+      if lcnt == 0 or pdata == 1 then
+        local exre = noit.pcre('\'?([^\'=]+)\'?=([\\-0-9\\.]+)([a-zA-Z%]+)?(?=[;\\s])')
+        rv, m, key, value, uom = exre(line)
+        if rv and key ~= nil then
+          if append_uom and uom ~= nil then
+            key = key .. "_" .. uom
+          end
+          check.metric(key, value)
+        end
+      end
+
+      lcnt = lcnt + 1
     end
   end
   -- turnaround time
@@ -188,4 +213,3 @@ function initiate(module, check)
   if good then check.good() else check.bad() end
   check.status(status)
 end
-

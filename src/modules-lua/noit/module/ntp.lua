@@ -44,7 +44,7 @@ function onload(image)
   <checkconfig>
     <parameter name="port"
                required="optional"
-               default="^123$"
+               default="123"
                allowed="\d+">The port to which we will attempt to speak NTP.</parameter>
     <parameter name="control"
                required="optional"
@@ -122,11 +122,12 @@ end
 local _sequence = 0
 function next_sequence()
   _sequence = _sequence + 1
+  _sequence = band(_sequence, 0xFFFF)
   return _sequence
 end
 
 function make_ntp_control(req)
-    req.version = req.version or 4 -- NTP version
+    req.version = req.version or 2 -- NTP version
     req.mode = req.mode or 6 -- control
     req.leap = req.leap or 0
     -- contruct
@@ -156,61 +157,73 @@ end
 function ntp_control(s, req)
     local f = { }
     local req_packet = make_ntp_control(req)
+    local error = nil
     s:send(req_packet)
 
     f.num_frags = 0
     f.offsets = {}
     local done = false
     repeat
+        local lerr = nil
         local rv, buf = s:recv(480) -- max packet
         local offset, count, cnt
         -- need at least a header
-        if buf:len() < 12 then return "short packet" end
+        if buf:len() < 12 then lerr = "short packet" end
+        if lerr == nil then
+          f.hdr = buf:sub(1,12)
+          f.buf = buf:sub(13,buf:len())
+          cnt, f.li_vn_mode, f.r_m_e_op, f.sequence,
+              f.status, f.associd, offset, count = string.unpack(f.hdr, '>bbHHHHH')
 
-        f.hdr = buf:sub(1,12)
-        f.buf = buf:sub(13,buf:len())
-        cnt, f.li_vn_mode, f.r_m_e_op, f.sequence,
-            f.status, f.associd, offset, count = string.unpack(f.hdr, '>bbHHHHH')
+          f.mode = band(f.li_vn_mode, 0x7)
+          f.version = band(rshift(f.li_vn_mode, 3), 0x7)
+          f.leap = band(rshift(f.li_vn_mode, 6), 0x3)
+          f.op = band(f.r_m_e_op, 0x1f)
+          f.is_more = band(f.r_m_e_op, 0x20) ~= 0
+          f.is_error = band(f.r_m_e_op, 0x40) ~= 0
+          f.is_response = band(f.r_m_e_op, 0x80) ~= 0
 
-        f.mode = band(f.li_vn_mode, 0x7)
-        f.version = band(rshift(f.li_vn_mode, 3), 0x7)
-        f.leap = band(rshift(f.li_vn_mode, 6), 0x3)
-        f.op = band(f.r_m_e_op, 0x1f)
-        f.is_more = band(f.r_m_e_op, 0x20) ~= 0
-        f.is_error = band(f.r_m_e_op, 0x40) ~= 0
-        f.is_response = band(f.r_m_e_op, 0x80) ~= 0
-
-        -- validate
-        if f.version > 4 or f.version < 1 then return "bad version" end
-        if f.mode ~= 6 then return "not a control packet" end
-        if not f.is_response then return "not a response packet" end
-        if req.sequence ~= f.sequence then return "sequence mismatch" end
-        if req.op ~= f.op then return "opcode mismatch " .. req.op .. " != " .. f.op  end
-        if f.is_error then
-            return "error: "
-                .. bit.tohex(band(rshift(f.status, 8), 0xff), 2)
+          -- validate
+          if f.version > 4 or f.version < 1 then lerr = "bad version: " .. f.version end
+          if f.mode ~= 6 then lerr = "not a control packet: mode " .. f.mode end
+          if not f.is_response then lerr = "not a response packet" end
+          if req.sequence ~= f.sequence then lerr = "sequence mismatch" .. req.sequence .. " != " .. f.sequence end
+          if req.op ~= f.op then lerr = "opcode mismatch " .. req.op .. " != " .. f.op  end
+          if f.is_error then
+              return "error: "
+                  .. bit.tohex(band(rshift(f.status, 8), 0xff), 2)
+          end
         end
-        local expect = band(band(12 + count + 3, bnot(3)),0xffff)
-        -- must be aligned on a word boundary
-        if band(buf:len(), 3) ~= 0 then return "bad padding" end
-        if expect > buf:len() then
-            return "bad payload size " .. expect .. " vs. " .. buf:len()
-        end
-        if expect < buf:len() then
+
+        if lerr == nil then
+          local expect = band(band(12 + count + 3, bnot(3)),0xffff)
+          -- must be aligned on a word boundary
+          if band(buf:len(), 3) ~= 0 then lerr = "bad padding" end
+          if expect > buf:len() then
+            lerr = "bad payload size " .. expect .. " vs. " .. buf:len()
+          end
+          if expect < buf:len() then
             -- auth
             return "auth unsupported " .. expect .. " vs. " .. buf:len()
+          end
         end
-        if f.num_frags > 23 then return "too many fragments" end
-        if count < f.buf:len() then
+        if lerr == nil then
+          if f.num_frags > 23 then return "too many fragments" end
+          if count < f.buf:len() then
             f.buf = f.buf:sub(1,count)
+          end
+          f.offsets[offset] = f.buf
+          done = not f.is_more
         end
-        f.offsets[offset] = f.buf
-        done = not f.is_more
+        if lerr ~= nil then
+          noit.log("debug", "ntp error:%s\n", lerr)
+        end
+        error = lerr
     until done
 
     f.data = ''
     for i, buf in pairs(f.offsets) do f.data = f.data .. buf end
-    return nil, f
+    return error, f
 end
 
 
@@ -274,6 +287,7 @@ function initiate_control(module, check, s)
     local i = 0
     local len, numassoc = result.data:len(), result.data:len() / 4;
     local use_id = 0
+    local selection = 4
     while len > 0 do
       local cnt, associd, status = string.unpack(result.data:sub(1+4*i, 4+4*i), '>HH')
       i = i + 1
@@ -286,13 +300,17 @@ function initiate_control(module, check, s)
           associations[i].prefer = band(associations[i].flash,0x2) ~= 0
           associations[i].burst = band(associations[i].flash,0x4) ~= 0
           associations[i].volley = band(associations[i].flash,0x1) ~= 0
+          if associations[i].flash > selection then
+            selection = associations[i].flash
+            use_id = i
+          end
       else
           associations[i].flash = band(rshift(status,8),0x3)
           associations[i].prefer = band(associations[i].flash,0x1) ~= 0
           associations[i].burst = band(associations[i].flash,0x2) ~= 0
           associations[i].volley = false
+          if(associations[i].prefer) then use_id = i end
       end
-      if(associations[i].prefer) then use_id = i end
     end
     if(use_id < 1) then use_id = 1 end
 
@@ -326,7 +344,8 @@ function initiate_control(module, check, s)
     local poll = math.pow(2, math.max(math.min(vars.ppoll or 17, vars.hpoll or 17), 3))
     check.metric_uint32('poll', poll)
     check.metric_double('delay', tonumber(vars.delay))
-    check.metric_double('offset', tonumber(vars.offset))
+    check.metric_double('offset', tonumber(vars.offset) / 1000)
+    check.metric_double('offset_ms', tonumber(vars.offset))
     check.metric_double('jitter', tonumber(vars.jitter))
     check.metric_double('dispersion', tonumber(vars.dispersion))
     check.metric_double('xleave', tonumber(vars.xleave))
@@ -378,6 +397,7 @@ function initiate(module, check)
 
     if # status.offset > 0 then
         check.metric_double('offset', status.avg_offset)
+        check.metric_double('offset_ms', status.avg_offset * 1000.0)
         check.metric_uint32('requests', cnt)
         check.metric_uint32('responses', status.responses)
         check.metric_uint32('stratum', status.stratum)

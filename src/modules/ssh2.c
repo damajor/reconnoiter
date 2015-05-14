@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,7 +31,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
+#include <mtev_defines.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -40,14 +41,19 @@
 #ifdef HAVE_SYS_FILIO_H
 #include <sys/filio.h>
 #endif
+#include <dlfcn.h>
+
+#include <mtev_hash.h>
 
 #include "noit_module.h"
 #include "noit_check.h"
 #include "noit_check_tools.h"
-#include "utils/noit_log.h"
-#include "utils/noit_hash.h"
+#include "noit_mtev_bridge.h"
 
 #include <libssh2.h>
+#ifdef HAVE_GCRYPT_H
+#include <gcrypt.h>
+#endif
 
 #define DEFAULT_SSH_PORT 22
 
@@ -77,8 +83,8 @@ typedef struct {
   eventer_t timeout_event; /* Only used for connect() */
 } ssh2_check_info_t;
 
-static noit_log_stream_t nlerr = NULL;
-static noit_log_stream_t nldeb = NULL;
+static mtev_log_stream_t nlerr = NULL;
+static mtev_log_stream_t nldeb = NULL;
 
 static void ssh2_cleanup(noit_module_t *self, noit_check_t *check) {
   ssh2_check_info_t *ci = check->closure;
@@ -103,43 +109,57 @@ static void ssh2_cleanup(noit_module_t *self, noit_check_t *check) {
     memset(ci, 0, sizeof(*ci));
   }
 }
+
+#ifdef HAVE_GCRYPT_H
+GCRY_THREAD_OPTION_PTHREAD_IMPL;
+#endif
+
 static int ssh2_init(noit_module_t *self) {
+#ifdef HAVE_GCRYPT_H
+  gcry_error_t (*control)(enum gcry_ctl_cmds CMD, ...);
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)0)
+#endif
+  control = dlsym(RTLD_DEFAULT, "gcry_control");
+  if(control) control(GCRYCTL_SET_THREAD_CBS, &gcry_threads_pthread);
+#endif
   return 0;
 }
-static int ssh2_config(noit_module_t *self, noit_hash_table *options) {
+static int ssh2_config(noit_module_t *self, mtev_hash_table *options) {
   return 0;
 }
 static void ssh2_log_results(noit_module_t *self, noit_check_t *check) {
-  stats_t current;
-  struct timeval duration;
+  struct timeval duration, now;
+  u_int32_t mduration;
   ssh2_check_info_t *ci = check->closure;
 
-  noit_check_stats_clear(&current);
+  gettimeofday(&now, NULL);
+  sub_timeval(now, check->last_fire_time, &duration);
+  mduration = duration.tv_sec * 1000 + duration.tv_usec / 1000;
+  noit_stats_set_whence(check, &now);
+  noit_stats_set_duration(check, mduration);
+  noit_stats_set_available(check, ci->available ? NP_AVAILABLE : NP_UNAVAILABLE);
+  noit_stats_set_state(check, ci->fingerprint[0] ? NP_GOOD : NP_BAD);
 
-  gettimeofday(&current.whence, NULL);
-  sub_timeval(current.whence, check->last_fire_time, &duration);
-  current.duration = duration.tv_sec * 1000 + duration.tv_usec / 1000;
-  current.available = ci->available ? NP_AVAILABLE : NP_UNAVAILABLE;
-  current.state = ci->fingerprint[0] ? NP_GOOD : NP_BAD;
-
-  if(ci->error) current.status = ci->error;
-  else if(ci->timed_out) current.status = "timeout";
-  else if(ci->fingerprint[0]) current.status = ci->fingerprint;
-  else current.status = "internal error";
+  if(ci->error) noit_stats_set_status(check, ci->error);
+  else if(ci->timed_out) noit_stats_set_status(check, "timeout");
+  else if(ci->fingerprint[0]) noit_stats_set_status(check, ci->fingerprint);
+  else noit_stats_set_status(check, "internal error");
 
   if(ci->fingerprint[0]) {
-    u_int32_t mduration = current.duration;
-    noit_stats_set_metric(&current, "duration", METRIC_UINT32, &mduration);
-    noit_stats_set_metric(&current, "fingerprint", METRIC_STRING,
+    noit_stats_set_metric(check, "duration", METRIC_UINT32, &mduration);
+    noit_stats_set_metric(check, "fingerprint", METRIC_STRING,
                           ci->fingerprint);
   }
-  noit_check_set_stats(self, check, &current);
+  noit_check_set_stats(check);
 }
 static int ssh2_drive_session(eventer_t e, int mask, void *closure,
                               struct timeval *now) {
   int i;
   const char *fingerprint;
   ssh2_check_info_t *ci = closure;
+  struct timeval diff;
+  int timeout_ms = 10; /* 10ms, gets set below */
   if(ci->state == WANT_CLOSE) {
     noit_check_t *check = ci->check;
     ssh2_log_results(ci->self, ci->check);
@@ -175,6 +195,13 @@ static int ssh2_drive_session(eventer_t e, int mask, void *closure,
       set_method(mac_sc, LIBSSH2_METHOD_MAC_SC);
       set_method(comp_cs, LIBSSH2_METHOD_COMP_CS);
       set_method(comp_sc, LIBSSH2_METHOD_COMP_SC);
+      if(compare_timeval(*now, e->whence) < 0) {
+        sub_timeval(e->whence, *now, &diff);
+        timeout_ms = diff.tv_sec * 1000 + diff.tv_usec / 1000;
+      }
+#if LIBSSH2_VERSION_NUM >= 0x010209
+      libssh2_session_set_timeout(ci->session, timeout_ms);
+#endif
       if (libssh2_session_startup(ci->session, e->fd)) {
         ci->timed_out = 0;
         ci->error = strdup("ssh session startup failed");
@@ -280,7 +307,7 @@ static int ssh2_initiate(noit_module_t *self, noit_check_t *check,
                          noit_check_t *cause) {
   ssh2_check_info_t *ci = check->closure;
   struct timeval p_int, __now;
-  int fd, rv;
+  int fd = -1, rv = -1;
   eventer_t e;
   union {
     struct sockaddr_in sin;
@@ -291,7 +318,7 @@ static int ssh2_initiate(noit_module_t *self, noit_check_t *check,
   const char *port_str = NULL;
 
   /* We cannot be running */
-  assert(!(check->flags & NP_RUNNING));
+  BAIL_ON_RUNNING_CHECK(check);
   check->flags |= NP_RUNNING;
 
   ci->self = self;
@@ -312,19 +339,19 @@ static int ssh2_initiate(noit_module_t *self, noit_check_t *check,
     goto fail;
   }
   /* Open a socket */
-  fd = socket(check->target_family, SOCK_STREAM, 0);
+  fd = socket(check->target_family, NE_SOCK_CLOEXEC|SOCK_STREAM, 0);
   if(fd < 0) goto fail;
 
   /* Make it non-blocking */
   if(eventer_set_fd_nonblocking(fd)) goto fail;
 
-  if(noit_hash_retr_str(check->config, "port", strlen("port"),
+  if(mtev_hash_retr_str(check->config, "port", strlen("port"),
                         &port_str)) {
     ssh_port = (unsigned short)atoi(port_str);
   }
 #define config_method(a) do { \
   const char *v; \
-  if(noit_hash_retr_str(check->config, "method_" #a, strlen("method_" #a), \
+  if(mtev_hash_retr_str(check->config, "method_" #a, strlen("method_" #a), \
                         &v)) \
     ci->methods.a = strdup(v); \
 } while(0)
@@ -391,9 +418,9 @@ static int ssh2_initiate_check(noit_module_t *self, noit_check_t *check,
   return 0;
 }
 
-static int ssh2_onload(noit_image_t *self) {
-  nlerr = noit_log_stream_find("error/ssh2");
-  nldeb = noit_log_stream_find("debug/ssh2");
+static int ssh2_onload(mtev_image_t *self) {
+  nlerr = mtev_log_stream_find("error/ssh2");
+  nldeb = mtev_log_stream_find("debug/ssh2");
   if(!nlerr) nlerr = noit_stderr;
   if(!nldeb) nldeb = noit_debug;
 
@@ -405,12 +432,12 @@ static int ssh2_onload(noit_image_t *self) {
 #include "ssh2.xmlh"
 noit_module_t ssh2 = {
   {
-    NOIT_MODULE_MAGIC,
-    NOIT_MODULE_ABI_VERSION,
-    "ssh2",
-    "Secure Shell version 2 checker",
-    ssh2_xml_description,
-    ssh2_onload
+    .magic = NOIT_MODULE_MAGIC,
+    .version = NOIT_MODULE_ABI_VERSION,
+    .name = "ssh2",
+    .description = "Secure Shell version 2 checker",
+    .xml_description = ssh2_xml_description,
+    .onload = ssh2_onload
   },
   ssh2_config,
   ssh2_init,

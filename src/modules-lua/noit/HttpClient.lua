@@ -28,6 +28,28 @@
 -- (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 -- OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+function Headers()
+  local map = {}
+  local mt = {
+    __index = function(t,k)
+      local K = map[string.lower(k)]
+      if K ~= nil then
+        return rawget(t,K)
+      end
+      return nil
+    end,
+    __newindex = function(t,k,v)
+      local kl = string.lower(k)
+      if map[kl] ~= nil then
+         rawset(t,map[kl],nil)
+      end
+      map[kl] = k
+      rawset(t,k,v)
+    end
+  }
+  return setmetatable({},mt)
+end
+
 local HttpClient = {};
 HttpClient.__index = HttpClient;
 
@@ -38,7 +60,7 @@ function HttpClient:new(hooks)
     return obj
 end
 
-function HttpClient:connect(target, port, ssl)
+function HttpClient:connect(target, port, ssl, ssl_host, ssl_layer)
     if ssl == nil then ssl = false end
     self.e = noit.socket(target)
     self.target = target
@@ -53,17 +75,21 @@ function HttpClient:connect(target, port, ssl)
     return self.e:ssl_upgrade_socket(self.hooks.certfile and self.hooks.certfile(),
                                      self.hooks.keyfile and self.hooks.keyfile(),
                                      self.hooks.cachain and self.hooks.cachain(),
-                                     self.hooks.ciphers and self.hooks.ciphers())
+                                     self.hooks.ciphers and self.hooks.ciphers(),
+                                     ssl_host, ssl_layer)
 end
 
 function HttpClient:ssl_ctx()
    return self.e:ssl_ctx()
 end
 
-function HttpClient:do_request(method, uri, headers, payload)
+function HttpClient:do_request(method, uri, _headers, payload, http_version)
+    local version = http_version or "1.1"
+    local headers = Headers()
+    for k,v in pairs(_headers) do headers[k] = v end
     self.raw_bytes = 0
     self.content_bytes = 0
-    local sstr = method .. " " .. uri .. " " .. "HTTP/1.1\r\n"
+    local sstr = method .. " " .. uri .. " " .. "HTTP/" ..  version .. "\r\n"
     headers["Content-Length"] = nil
     if payload ~= nil and string.len(payload) > 0 then
       headers["Content-Length"] = string.len(payload)
@@ -85,16 +111,18 @@ end
 function HttpClient:get_headers()
     local lasthdr
     local str = self.e:read("\n");
+    local cookie_count = 1;
     if str == nil then error("no response") end
     self.protocol, self.code = string.match(str, "^HTTP/(%d.%d)%s+(%d+)%s+")
     if self.protocol == nil then error("malformed HTTP response") end
     self.code = tonumber(self.code)
-    self.headers = {}
+    self.headers = Headers()
+    self.cookies = {}
     while true do
         local str = self.e:read("\n")
         if str == nil or str == "\r\n" or str == "\n" then break end
         str = string.gsub(str, '%s+$', '')
-        local hdr, val = string.match(str, "^([-_%a%d]+):%s*(.*)$")
+        local hdr, val = string.match(str, "^([%.-_%a%d]+):%s*(.*)$")
         if hdr == nil then
             if lasthdr == nil then error ("malformed header line") end
             hdr = lasthdr
@@ -102,16 +130,25 @@ function HttpClient:get_headers()
             if val == nil then error("malformed header line") end
             self.headers[hdr] = self.headers[hdr] .. " " .. val
         else
-            hdr = string.lower(hdr)
-            self.headers[hdr] = val
+            if string.lower(hdr) == "set-cookie" then
+                self.cookies[cookie_count] = val;
+                cookie_count = cookie_count + 1;
+            else
+                self.headers[hdr] = val
+            end
             lasthdr = hdr
         end
     end
-    if self.hooks.headers ~= nil then self.hooks.headers(self.headers) end
+    if self.hooks.headers ~= nil then self.hooks.headers(self.headers, self.cookies) end
 end
 
 function ce_passthru(str) 
     return str
+end
+
+function te_none(self)
+    self.content_bytes = ''
+    if self.hooks.consume ~= nil then self.hooks.consume('') end
 end
 
 function te_close(self, content_enc_func)
@@ -131,7 +168,7 @@ function te_close(self, content_enc_func)
 end
 
 function te_length(self, content_enc_func, read_limit)
-    local len = tonumber(self.headers["content-length"])
+    local len = tonumber(self.headers["Content-Length"])
     if read_limit and read_limit > 0 and len > read_limit then
       len = read_limit
       self.truncated = true
@@ -143,7 +180,9 @@ function te_length(self, content_enc_func, read_limit)
             len = len - string.len(str)
         end
         local decoded = content_enc_func(str)
-        self.content_bytes = self.content_bytes + string.len(decoded)
+        if decoded ~= nil then
+          self.content_bytes = self.content_bytes + string.len(decoded)
+        end
         if self.hooks.consume ~= nil then self.hooks.consume(decoded) end
     until str == nil or len == 0
 end
@@ -163,7 +202,9 @@ function te_chunked(self, content_enc_func, read_limit)
         if string.len(str or "") ~= len then error("short chunked read") end
         self.raw_bytes = self.raw_bytes + string.len(str)
         local decoded = content_enc_func(str)
-        self.content_bytes = self.content_bytes + string.len(decoded)
+        if decoded ~= nil then
+          self.content_bytes = self.content_bytes + string.len(decoded)
+        end
         if self.hooks.consume ~= nil then self.hooks.consume(decoded) end
         if read_limit and read_limit > 0 then
           if self.content_bytes > read_limit then
@@ -185,22 +226,43 @@ end
 
 function HttpClient:get_body(read_limit)
     local cefunc = ce_passthru
-    local ce = self.headers["content-encoding"]
+    local ce = self.headers["Content-Encoding"]
     if ce ~= nil then
-        if ce == "gzip" then
-            cefunc = noit.gunzip()
-        elseif ce == "deflate" then
-            cefunc = noit.gunzip()
-        else
-            error("unknown content-encoding: " .. ce)
+      local deflater
+      if ce == 'gzip' then
+        deflater = noit.gunzip()
+      elseif ce == 'deflate' then
+        deflater = noit.gunzip()
+      elseif ce:find(',') then
+        local tokens = noit.extras.split(ce, ",")
+        for _, token in pairs(tokens) do
+          if token:gsub("^%s*(.-)%s*$", "%1") == "gzip" then
+            deflater = noit.gunzip()
+            break
+          elseif token:gsub("^%s*(.-)%s*$", "%1") == "deflate" then
+            deflater = noit.gunzip()
+            break
+          end
         end
+      end
+
+      if deflater == nil then
+        error("unknown content-encoding: " .. ce)
+      end
+
+      cefunc = function(str)
+        return deflater(str, read_limit)
+      end
     end
-    local te = self.headers["transfer-encoding"]
-    local cl = self.headers["content-length"]
+    local te = self.headers["Transfer-Encoding"]
+    local cl = self.headers["Content-Length"]
     if te ~= nil and te == "chunked" then
         return te_chunked(self, cefunc, read_limit)
     elseif cl ~= nil and tonumber(cl) ~= nil then
         return te_length(self, cefunc, read_limit)
+    elseif self.headers["Connection"] == "keep-alive"
+       and (self.code == 204 or self.code == 304) then
+        return te_none(self)
     end
     return te_close(self, cefunc)
 end
@@ -208,6 +270,73 @@ end
 function HttpClient:get_response(read_limit)
     self:get_headers()
     return self:get_body(read_limit)
+end
+
+function HttpClient:auth_digest(method, uri, user, pass, challenge)
+    local c = ', ' .. challenge
+    local nc = '00000001'
+    local function rand_string(t, l)
+        local n = #t
+        local o = ''
+        while l > 0 do
+          o = o .. t[math.random(1,n)]
+          l = l - 1
+        end
+        return o
+    end
+    local cnonce =
+        rand_string({'a','b','c','d','e','f','g','h','i','j','k','l','m',
+                     'n','o','p','q','r','s','t','u','v','x','y','z','A',
+                     'B','C','D','E','F','G','H','I','J','K','L','M','N',
+                     'O','P','Q','R','S','T','U','V','W','X','Y','Z','0',
+                     '1','2','3','4','5','6','7','8','9'}, 8)
+    local p = {}
+    for k,v in string.gmatch(c, ',%s+(%a+)="([^"]+)"') do p[k] = v end
+    for k,v in string.gmatch(c, ',%s+(%a+)=([^",][^,]*)') do p[k] = v end
+
+    -- qop can be a list
+    for q in string.gmatch(p.qop, '([^,]+)') do
+        if q == "auth" then p.qop = "auth" end
+    end
+
+    -- calculate H(A1)
+    local ha1 = noit.md5_hex(user .. ':' .. p.realm .. ':' .. pass)
+    if string.lower(p.qop or '') == 'md5-sess' then
+        ha1 = noit.md5_hex(ha1 .. ':' .. p.nonce .. ':' .. cnonce)
+    end
+    -- calculate H(A2)
+    local ha2 = ''
+    if p.qop == "auth" or p.qop == nil then
+        ha2 = noit.md5_hex(method .. ':' .. uri)
+    else
+        -- we don't support auth-int
+        error("qop=" .. p.qop .. " is unsupported")
+    end
+    local resp = ''
+    if p.qop == "auth" then
+        resp = noit.md5_hex(ha1 .. ':' .. p.nonce .. ':' .. nc
+                                .. ':' .. cnonce .. ':' .. p.qop
+                                .. ':' .. ha2)
+    else
+        resp = noit.md5_hex(ha1 .. ':' .. p.nonce .. ':' .. ha2)
+    end
+    local o = {}
+    o.username = user
+    o.realm = p.realm
+    o.nonce = p.nonce
+    o.uri = uri
+    o.cnonce = cnonce
+    o.qop = p.qop
+    o.response = resp
+    o.algorithm = p.algorithm
+    if p.opaque then o.opaque = p.opaque end
+    local hdr = ''
+    for k,v in pairs(o) do
+      if hdr == '' then hdr = k .. '="' .. v .. '"'
+      else hdr = hdr .. ', ' .. k .. '="' .. v .. '"' end
+    end
+    hdr = hdr .. ', nc=' .. nc
+    return hdr
 end
 
 return HttpClient

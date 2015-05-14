@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -33,42 +34,16 @@
 #ifndef _STRATCON_LOG_STREAMER_H
 #define _STRATCON_LOG_STREAMER_H
 
-#include "noit_conf.h"
-#include "utils/noit_atomic.h"
-#include "jlog/jlog.h"
+#include <mtev_conf.h>
+#include <mtev_atomic.h>
+#include <mtev_reverse_socket.h>
+
+#include <jlog.h>
 #include <netinet/in.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
+
 #include "stratcon_datastore.h"
-
-#define DEFAULT_NOIT_CONNECTION_TIMEOUT 60000 /* 60 seconds */
-
-typedef struct noit_connection_ctx_t {
-  noit_atomic32_t refcnt;
-  union {
-    struct sockaddr remote;
-    struct sockaddr_un remote_un;
-    struct sockaddr_in remote_in;
-    struct sockaddr_in6 remote_in6;
-  } r;
-  socklen_t remote_len;
-  char *remote_str;
-  char *remote_cn;
-  u_int32_t current_backoff;
-  int wants_shutdown;
-  int wants_permanent_shutdown;
-  int max_silence;
-  noit_hash_table *config;
-  noit_hash_table *sslconfig;
-  struct timeval last_connect;
-  eventer_t timeout_event;
-  eventer_t retry_event;
-  eventer_t e;
-
-  eventer_func_t consumer_callback;
-  void (*consumer_free)(void *);
-  void *consumer_ctx;
-} noit_connection_ctx_t;
 
 typedef struct jlog_streamer_ctx_t {
   u_int32_t jlog_feed_cmd;
@@ -112,13 +87,8 @@ API_EXPORT(jlog_streamer_ctx_t *)
 API_EXPORT(void)
   jlog_streamer_ctx_free(void *cl);
 API_EXPORT(int)
-  noit_connection_update_timeout(noit_connection_ctx_t *ctx);
-API_EXPORT(int)
-  noit_connection_disable_timeout(noit_connection_ctx_t *ctx);
-API_EXPORT(void)
-  noit_connection_ctx_dealloc(noit_connection_ctx_t *ctx);
-API_EXPORT(void)
   stratcon_streamer_connection(const char *toplevel, const char *destination,
+                               const char *type,
                                eventer_func_t handler,
                                void *(*handler_alloc)(void), void *handler_ctx,
                                void (*handler_free)(void *));

@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2009, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,8 +31,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
-#include "noit_version.h"
+#include <mtev_defines.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -39,23 +39,29 @@
 #include <assert.h>
 #include <math.h>
 
+#include <mtev_hash.h>
+
+#include "noit_mtev_bridge.h"
 #include "noit_module.h"
+#include "noit_jlog_listener.h"
 #include "noit_check.h"
 #include "noit_check_tools.h"
-#include "noit_jlog_listener.h"
-#include "utils/noit_log.h"
-#include "utils/noit_hash.h"
+#include "noit_version.h"
 
 typedef struct {
   noit_module_t *self;
   noit_check_t *check;
-  noit_hash_table attrs;
+  mtev_hash_table attrs;
   size_t logsize;
   int timed_out;
 } selfcheck_info_t;
 
-static noit_log_stream_t nlerr = NULL;
-static noit_log_stream_t nldeb = NULL;
+struct threadq_crutch {
+  noit_check_t *check;
+};
+
+static mtev_log_stream_t nlerr = NULL;
+static mtev_log_stream_t nldeb = NULL;
 
 static void selfcheck_cleanup(noit_module_t *self, noit_check_t *check) {
   selfcheck_info_t *ci = check->closure;
@@ -67,31 +73,31 @@ static void selfcheck_cleanup(noit_module_t *self, noit_check_t *check) {
 static void jobq_thread_helper(eventer_jobq_t *jobq, void *closure) {
   int s32;
   char buffer[128];
-  stats_t *current = (stats_t *)closure;
+  struct threadq_crutch *crutch = (struct threadq_crutch *)closure;
   s32 = jobq->concurrency;
   if(s32 == 0) return; /* omit if no concurrency */
   snprintf(buffer, sizeof(buffer), "%s_threads", jobq->queue_name);
-  noit_stats_set_metric(current, buffer, METRIC_INT32, &s32);
+  noit_stats_set_metric(crutch->check, buffer, METRIC_INT32, &s32);
 }
-static int selfcheck_feed_details(jlog_feed_stats_t *s, void *vcurrent) {
+static int selfcheck_feed_details(jlog_feed_stats_t *s, void *closure) {
   char buff[256];
   uint64_t ms;
   struct timeval now, diff;
-  stats_t *current = (stats_t *)vcurrent;
+  struct threadq_crutch *crutch = (struct threadq_crutch *)closure;
   gettimeofday(&now, NULL);
 
   if(s->last_connection.tv_sec > 0) {
     sub_timeval(now, s->last_connection, &diff);
     ms = diff.tv_sec * 1000 + diff.tv_usec / 1000;
     snprintf(buff, sizeof(buff), "feed`%s`last_connection_ms", s->feed_name);
-    noit_stats_set_metric(current, buff, METRIC_UINT64, &ms);
+    noit_stats_set_metric(crutch->check, buff, METRIC_UINT64, &ms);
   }
 
   if(s->last_checkpoint.tv_sec > 0) {
     sub_timeval(now, s->last_checkpoint, &diff);
     ms = diff.tv_sec * 1000 + diff.tv_usec / 1000;
     snprintf(buff, sizeof(buff), "feed`%s`last_checkpoint_ms", s->feed_name);
-    noit_stats_set_metric(current, buff, METRIC_UINT64, &ms);
+    noit_stats_set_metric(crutch->check, buff, METRIC_UINT64, &ms);
   }
   return 1;
 }
@@ -100,49 +106,52 @@ static void selfcheck_log_results(noit_module_t *self, noit_check_t *check) {
   u_int64_t u64;
   int64_t s64;
   int32_t s32;
-  stats_t current;
-  struct timeval duration, epoch, diff;
+  struct threadq_crutch crutch;
+  struct timeval now, duration, epoch, diff;
   selfcheck_info_t *ci = check->closure;
 
-  noit_check_stats_clear(&current);
+  crutch.check = check;
 
-  gettimeofday(&current.whence, NULL);
-  sub_timeval(current.whence, check->last_fire_time, &duration);
-  current.duration = duration.tv_sec * 1000 + duration.tv_usec / 1000;
-  current.available = NP_UNAVAILABLE;
-  current.state = NP_BAD;
-  if(ci->timed_out) current.status = "timeout";
+  gettimeofday(&now, NULL);
+  sub_timeval(now, check->last_fire_time, &duration);
+  noit_stats_set_whence(check, &now);
+  noit_stats_set_duration(check, duration.tv_sec * 1000 + duration.tv_usec / 1000);
+  noit_stats_set_available(check, NP_UNAVAILABLE);
+  noit_stats_set_state(check, NP_BAD);
+  if(ci->timed_out) noit_stats_set_status(check, "timeout");
   else {
-    current.available = NP_AVAILABLE;
-    current.state = NP_GOOD;
-    current.status = "ok";
+    noit_stats_set_available(check, NP_AVAILABLE);
+    noit_stats_set_state(check, NP_GOOD);
+    noit_stats_set_status(check, "ok");
   }
   /* Set all the metrics here */
   s64 = (int64_t)ci->logsize;
-  noit_stats_set_metric(&current, "feed_bytes", METRIC_INT64, &s64);
+  noit_stats_set_metric(check, "feed_bytes", METRIC_INT64, &s64);
   s32 = noit_poller_check_count();
-  noit_stats_set_metric(&current, "check_cnt", METRIC_INT32, &s32);
+  noit_stats_set_metric(check, "check_cnt", METRIC_INT32, &s32);
   s32 = noit_poller_transient_check_count();
-  noit_stats_set_metric(&current, "transient_cnt", METRIC_INT32, &s32);
+  noit_stats_set_metric(check, "transient_cnt", METRIC_INT32, &s32);
   if(eventer_get_epoch(&epoch)) s64 = 0;
   else {
-    sub_timeval(current.whence, epoch, &diff);
+    sub_timeval(now, epoch, &diff);
     s64 = diff.tv_sec;
   }
-  noit_stats_set_metric(&current, "uptime", METRIC_INT64, &s64);
-  eventer_jobq_process_each(jobq_thread_helper, &current);
+  noit_stats_set_metric(check, "uptime", METRIC_INT64, &s64);
+  eventer_jobq_process_each(jobq_thread_helper, &crutch);
   noit_build_version(buff, sizeof(buff));
-  noit_stats_set_metric(&current, "version", METRIC_STRING, buff);
+  noit_stats_set_metric(check, "version", METRIC_STRING, buff);
   u64 = noit_check_completion_count();
-  noit_stats_set_metric(&current, "checks_run", METRIC_UINT64, &u64);
+  noit_stats_set_metric(check, "checks_run", METRIC_UINT64, &u64);
+  u64 = noit_check_metric_count();
+  noit_stats_set_metric(check, "metrics_collected", METRIC_UINT64, &u64);
   /* feed pull info */
-  noit_jlog_foreach_feed_stats(selfcheck_feed_details, &current);
+  noit_jlog_foreach_feed_stats(selfcheck_feed_details, &crutch);
 
-  noit_check_set_stats(self, check, &current);
+  noit_check_set_stats(check);
 }
 
 #define FETCH_CONFIG_OR(key, str) do { \
-  if(!noit_hash_retr_str(check->config, #key, strlen(#key), &key)) \
+  if(!mtev_hash_retr_str(check->config, #key, strlen(#key), &key)) \
     key = str; \
 } while(0)
 
@@ -152,7 +161,7 @@ static int selfcheck_log_size(eventer_t e, int mask, void *closure,
   noit_check_t *check = ci->check;
   const char *feedname;
   char feedname_buff[128];
-  noit_log_stream_t feed;
+  mtev_log_stream_t feed;
 
   if(mask & (EVENTER_READ | EVENTER_WRITE)) {
     /* this case is impossible from the eventer.  It is called as
@@ -169,9 +178,9 @@ static int selfcheck_log_size(eventer_t e, int mask, void *closure,
       FETCH_CONFIG_OR(feedname, "feed");
       noit_check_interpolate(feedname_buff, sizeof(feedname_buff), feedname,
                              &ci->attrs, check->config);
-      feed = noit_log_stream_find(feedname_buff);
+      feed = mtev_log_stream_find(feedname_buff);
       if(!feed) ci->logsize = -1;
-      else ci->logsize = noit_log_stream_size(feed);
+      else ci->logsize = mtev_log_stream_size(feed);
       ci->timed_out = 0;
       return 0;
       break;
@@ -191,7 +200,7 @@ static int selfcheck_initiate(noit_module_t *self, noit_check_t *check,
   struct timeval __now;
 
   /* We cannot be running */
-  assert(!(check->flags & NP_RUNNING));
+  BAIL_ON_RUNNING_CHECK(check);
   check->flags |= NP_RUNNING;
 
   ci->self = self;
@@ -214,9 +223,9 @@ static int selfcheck_initiate_check(noit_module_t *self, noit_check_t *check,
   return 0;
 }
 
-static int selfcheck_onload(noit_image_t *self) {
-  nlerr = noit_log_stream_find("error/selfcheck");
-  nldeb = noit_log_stream_find("debug/selfcheck");
+static int selfcheck_onload(mtev_image_t *self) {
+  nlerr = mtev_log_stream_find("error/selfcheck");
+  nldeb = mtev_log_stream_find("debug/selfcheck");
   if(!nlerr) nlerr = noit_stderr;
   if(!nldeb) nldeb = noit_debug;
 
@@ -227,12 +236,12 @@ static int selfcheck_onload(noit_image_t *self) {
 #include "selfcheck.xmlh"
 noit_module_t selfcheck = {
   {
-    NOIT_MODULE_MAGIC,
-    NOIT_MODULE_ABI_VERSION,
-    "selfcheck",
-    "noitd self-checker",
-    selfcheck_xml_description,
-    selfcheck_onload
+    .magic = NOIT_MODULE_MAGIC,
+    .version = NOIT_MODULE_ABI_VERSION,
+    .name = "selfcheck",
+    .description = "noitd self-checker",
+    .xml_description = selfcheck_xml_description,
+    .onload = selfcheck_onload
   },
   NULL,
   NULL,

@@ -1,9 +1,34 @@
 <module>
   <name>collectd</name>
-  <description><para>The collectd module provides collectd support for Reconnoiter.  The collectd modules listens on a UDP port and waits for metrics to come from a collectd agent. It also provides support for signing and encrypting metrics from the collectd agent, which is supported in version 4.7.0 and above.  Only one is supported per target.</para></description>
+  <description><para>The collectd module provides collectd support for Reconnoiter.  The collectd modules listens on a UDP port and waits for metrics to come from a collectd agent. It also provides support for signing and encrypting metrics from the collectd agent, which is supported in version 4.7.0 and above.  Only one is supported per target.</para>
+    <para>Additionally, this module registers a REST handler to support collectd's write_http output plugin.  This exposes a REST endpoint at /module/collectd.</para></description>
   <loader>C</loader>
   <image>collectd.so</image>
   <moduleconfig>
+    <parameter name="host_len"
+               required="optional"
+               default="64"
+               allowed="\d+">Maximum length of the host field [64, 256].</parameter>
+    <parameter name="plugin_len"
+               required="optional"
+               default="64"
+               allowed="\d+">Maximum length of the plugin field [64, 256].</parameter>
+    <parameter name="plugin_instance_len"
+               required="optional"
+               default="64"
+               allowed="\d+">Maximum length of the plugin_instance field [64, 256].</parameter>
+    <parameter name="type_len"
+               required="optional"
+               default="64"
+               allowed="\d+">Maximum length of the type_instance field [64, 256].</parameter>
+    <parameter name="type_instance_len"
+               required="optional"
+               default="64"
+               allowed="\d+">Maximum length of the type_instance field [64, 256].</parameter>
+    <parameter name="asynch_metrics"
+               required="optional"
+               default="false"
+               allowed="(?:true|false)">Report metrics asthey arrive, not on the period provided.</parameter>
     <parameter name="collectd_port"
                required="required"
                default="25826"
@@ -12,17 +37,30 @@
                required="options"
                default="true"
                allowed="(?:true|on|false|off)">Specify whether collectd notifications are acted upon.</parameter>
-  </moduleconfig>
-  <checkconfig>
     <parameter name="security_level"
                required="optional"
                allowed="\d+">An integer detailing the security level which to allow.  0 for all packets allowed, 1 for signed and encrypted packets allowed, 2 for only encrypted packets allowed.</parameter>
     <parameter name="username"
                required="optional"
-               allowed=".+">The collectd username for authenticating signed and encrypted packets</parameter>
-    <parameter name="password"
+               allowed=".+">The collectd username for authenticating signed and encrypted packets. Also the username used for HTTP authentication when using the write_http ingestion method.</parameter>
+    <parameter name="secret"
                required="optional"
-               allowed=".+">The collectd password for authenticating signed and encrypted packets</parameter>
+               allowed=".+">The collectd password for authenticating signed and encrypted packets. Also the password used for HTTP authentication when using the write_http ingestion method.</parameter>
+  </moduleconfig>
+  <checkconfig>
+    <parameter name="asynch_metrics"
+               required="optional"
+               default="false"
+               allowed="(?:true|false)">Report metrics asthey arrive, not on the period provided.</parameter>
+    <parameter name="security_level"
+               required="optional"
+               allowed="\d+">An integer detailing the security level which to allow.  0 for all packets allowed, 1 for signed and encrypted packets allowed, 2 for only encrypted packets allowed.</parameter>
+    <parameter name="username"
+               required="optional"
+               allowed=".+">The collectd username for authenticating signed and encrypted packets. Also the username used for HTTP authentication when using the write_http ingestion method.</parameter>
+    <parameter name="secret"
+               required="optional"
+               allowed=".+">The collectd password for authenticating signed and encrypted packets. Also the password used for HTTP authentication when using the write_http ingestion method.</parameter>
   </checkconfig>
   <examples>
     <example>
@@ -43,6 +81,18 @@
           Password "s3cr3t"
         </Server>
       </Plugin>
+
+      <Plugin write_http>
+        <URL "https://127.0.0.1:43191/module/collectd/">
+          User "us3rname"
+          Password "s3cr3t"
+          VerifyPeer false
+          VerifyHost false
+          CACert "/etc/ssl/ca.crt"
+          Format "JSON"
+          StoreRates false
+        </URL>
+      </Plugin>
       ]]></programlisting>
 
       <programlisting><![CDATA[
@@ -51,7 +101,7 @@
           <module image="collectd" name="collectd">
             <config>
               <username>us3rname</username>
-              <password>s3cr3t</password>
+              <secret>s3cr3t</secret>
               <security_level>2</security_level>
             </config>
           </module>

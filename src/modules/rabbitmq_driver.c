@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2011, OmniTI Computer Consulting, Inc.
- * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -29,21 +29,30 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
 
-#include "noit_defines.h"
-#include "noit_module.h"
-#include "eventer/eventer.h"
-#include "utils/noit_log.h"
-#include "stratcon_iep.h"
-#include "noit_conf.h"
+#include <mtev_defines.h>
+
+#include <poll.h>
+#include <unistd.h>
+#include <assert.h>
+#include <errno.h>
+
+#include <mtev_dso.h>
+#include <eventer/eventer.h>
+#include <mtev_log.h>
+#include <stratcon_iep.h>
+#include <mtev_conf.h>
+
 #include "librabbitmq/amqp.h"
 #include "librabbitmq/amqp_framing.h"
 #include "rabbitmq_driver.xmlh"
 
-#include <poll.h>
-#include <assert.h>
-
 #define MAX_CONCURRENCY 16
 #define MAX_HOSTS 10
+#define DEFAULT_SNDBUF (1 << 20)
+#define DEFAULT_RCVBUF (1 << 20)
+
+static socklen_t desired_sndbuf = DEFAULT_SNDBUF;
+static socklen_t desired_rcvbuf = DEFAULT_RCVBUF;
 
 static pthread_mutex_t driver_lock;
 struct amqp_driver {
@@ -66,24 +75,24 @@ struct amqp_driver {
 };
 
 static struct {
-  noit_atomic64_t basic_returns;
-  noit_atomic64_t connects;
-  noit_atomic64_t inbound_methods;
-  noit_atomic64_t inbound_heartbeats;
-  noit_atomic64_t publications;
-  noit_atomic64_t concurrency;
+  mtev_atomic64_t basic_returns;
+  mtev_atomic64_t connects;
+  mtev_atomic64_t inbound_methods;
+  mtev_atomic64_t inbound_heartbeats;
+  mtev_atomic64_t publications;
+  mtev_atomic64_t concurrency;
   struct amqp_driver thread_states[MAX_CONCURRENCY];
 } stats;
-#define BUMPSTAT(a) noit_atomic_inc64(&stats.a)
+#define BUMPSTAT(a) mtev_atomic_inc64(&stats.a)
 
-static iep_thread_driver_t *noit_rabbimq_allocate() {
-  char *hostname, *cp, *brk;
+static iep_thread_driver_t *noit_rabbimq_allocate(mtev_conf_section_t conf) {
+  char *hostname = NULL, *cp, *brk;
   struct amqp_driver *dr = NULL;
   int i;
 
   pthread_mutex_lock(&driver_lock);
   for(i=0; i<MAX_HOSTS; i++) {
-    if(stats.thread_states[i].owner == (pthread_t)NULL) {
+    if(stats.thread_states[i].owner == (pthread_t)(vpsized_int)NULL) {
       stats.thread_states[i].owner = pthread_self();
       dr = &stats.thread_states[i];
       break;
@@ -92,18 +101,18 @@ static iep_thread_driver_t *noit_rabbimq_allocate() {
   pthread_mutex_unlock(&driver_lock);
   if(!dr) return NULL;
   dr->nconnects = rand();
-#define GETCONFSTR(w) noit_conf_get_stringbuf(NULL, "/stratcon/iep/mq/" #w, dr->w, sizeof(dr->w))
+#define GETCONFSTR(w) mtev_conf_get_stringbuf(conf, #w, dr->w, sizeof(dr->w))
   GETCONFSTR(exchange);
   if(!GETCONFSTR(routingkey))
     dr->routingkey[0] = '\0';
   GETCONFSTR(username);
   GETCONFSTR(password);
   if(!GETCONFSTR(vhost)) { dr->vhost[0] = '/'; dr->vhost[1] = '\0'; }
-  if(!noit_conf_get_int(NULL, "/stratcon/iep/mq/heartbeat", &dr->heartbeat))
+  if(!mtev_conf_get_int(conf, "heartbeat", &dr->heartbeat))
     dr->heartbeat = 5000;
   dr->heartbeat = (dr->heartbeat + 999) / 1000;
 
-  noit_conf_get_string(NULL, "/stratcon/iep/mq/hostname", &hostname);
+  (void)mtev_conf_get_string(conf, "hostname", &hostname);
   if(!hostname) hostname = strdup("127.0.0.1");
   for(cp = hostname; cp; cp = strchr(cp+1, ',')) dr->nhosts++;
   if(dr->nhosts > MAX_HOSTS) dr->nhosts = MAX_HOSTS;
@@ -112,15 +121,16 @@ static iep_thread_driver_t *noit_rabbimq_allocate() {
     strlcpy(dr->hostname[i], cp, sizeof(dr->hostname[i]));
   free(hostname);
 
-  if(!noit_conf_get_int(NULL, "/stratcon/iep/mq/port", &dr->port))
+  if(!mtev_conf_get_int(conf, "port", &dr->port))
     dr->port = 5672;
-  noit_atomic_inc64(&stats.concurrency);
+  mtev_atomic_inc64(&stats.concurrency);
   return (iep_thread_driver_t *)dr;
 }
 static int noit_rabbimq_disconnect(iep_thread_driver_t *d) {
   struct amqp_driver *dr = (struct amqp_driver *)d;
   if(dr->connection) {
     amqp_destroy_connection(dr->connection);
+    if(dr->sockfd >= 0) close(dr->sockfd);
     dr->sockfd = -1;
     dr->connection = NULL;
     return 0;
@@ -133,7 +143,7 @@ static void noit_rabbimq_deallocate(iep_thread_driver_t *d) {
   pthread_mutex_lock(&driver_lock);
   memset(dr, 0, sizeof(*dr));
   pthread_mutex_unlock(&driver_lock);
-  noit_atomic_dec64(&stats.concurrency);
+  mtev_atomic_dec64(&stats.concurrency);
   free(dr);
 }
 static void noit_rabbitmq_read_frame(struct amqp_driver *dr) {
@@ -150,29 +160,29 @@ static void noit_rabbitmq_read_frame(struct amqp_driver *dr) {
       if(rv > 0) {
         if(f.frame_type == AMQP_FRAME_HEARTBEAT) {
           BUMPSTAT(inbound_heartbeats);
-          noitL(noit_debug, "amqp <- hearbeat\n");
+          mtevL(mtev_debug, "amqp <- hearbeat\n");
         }
         else if(f.frame_type == AMQP_FRAME_METHOD) {
           BUMPSTAT(inbound_methods);
-          noitL(noit_error, "amqp <- method [%s]\n", amqp_method_name(f.payload.method.id));
+          mtevL(mtev_error, "amqp <- method [%s]\n", amqp_method_name(f.payload.method.id));
           dr->has_error = 1;
           switch(f.payload.method.id) {
             case AMQP_CHANNEL_CLOSE_METHOD: {
                 amqp_channel_close_t *m = (amqp_channel_close_t *) f.payload.method.decoded;
-                noitL(noit_error, "AMQP channel close error %d: %s\n",
+                mtevL(mtev_error, "AMQP channel close error %d: %s\n",
                       m->reply_code, (char *)m->reply_text.bytes);
               }
               break;
             case AMQP_CONNECTION_CLOSE_METHOD: {
                 amqp_connection_close_t *m = (amqp_connection_close_t *) f.payload.method.decoded;
-                noitL(noit_error, "AMQP connection close error %d: %s\n",
+                mtevL(mtev_error, "AMQP connection close error %d: %s\n",
                       m->reply_code, (char *)m->reply_text.bytes);
               }
               break;
           }
         }
         else {
-          noitL(noit_error, "amqp <- frame [%d]\n", f.frame_type);
+          mtevL(mtev_error, "amqp <- frame [%d]\n", f.frame_type);
         }
       }
       else break;
@@ -190,14 +200,14 @@ static void noit_rabbitmq_heartbeat(struct amqp_driver *dr) {
     f.frame_type = AMQP_FRAME_HEARTBEAT;
     f.channel = 0;
     amqp_send_frame(dr->connection, &f);
-    noitL(noit_debug, "amqp -> hearbeat\n");
+    mtevL(mtev_debug, "amqp -> hearbeat\n");
     memcpy(&dr->last_hb, &n, sizeof(n));
   }
 }
 static void
 noit_rabbitmq_brcb(amqp_channel_t channel, amqp_basic_return_t *m, void *closure) {
   BUMPSTAT(basic_returns);
-  noitL(noit_error, "AMQP return [%d:%.*s]\n", m->reply_code,
+  mtevL(mtev_debug, "AMQP return [%d:%.*s]\n", m->reply_code,
         (int)m->reply_text.len, (char *)m->reply_text.bytes);
 }
 static int noit_rabbimq_connect(iep_thread_driver_t *dr) {
@@ -208,7 +218,7 @@ static int noit_rabbimq_connect(iep_thread_driver_t *dr) {
     struct timeval timeout;
     amqp_rpc_reply_t r, *rptr;
 
-    noitL(noit_error, "AMQP connect: %s:%d\n",
+    mtevL(mtev_error, "AMQP connect: %s:%d\n",
           driver->hostname[sidx], driver->port);
     BUMPSTAT(connects);
     driver->hostidx = sidx;
@@ -216,10 +226,14 @@ static int noit_rabbimq_connect(iep_thread_driver_t *dr) {
     timeout.tv_usec = 0;
     driver->sockfd = amqp_open_socket(driver->hostname[sidx], driver->port, &timeout);
     if(driver->sockfd < 0) {
-      noitL(noit_error, "AMQP connect failed: %s:%d\n",
+      mtevL(mtev_error, "AMQP connect failed: %s:%d\n",
             driver->hostname[sidx], driver->port);
       return -1;
     }
+    if(setsockopt(driver->sockfd, SOL_SOCKET, SO_SNDBUF, &desired_sndbuf, sizeof(desired_sndbuf)) < 0)
+      mtevL(mtev_debug, "rabbitmq: setsockopt(SO_SNDBUF, %ld) -> %s\n", desired_sndbuf, strerror(errno));
+    if(setsockopt(driver->sockfd, SOL_SOCKET, SO_RCVBUF, &desired_rcvbuf, sizeof(desired_rcvbuf)) < 0)
+      mtevL(mtev_debug, "rabbitmq: setsockopt(SO_RCVBUF, %ld) -> %s\n", desired_rcvbuf, strerror(errno));
     driver->has_error = 0;
     driver->connection = amqp_new_connection();
     amqp_set_basic_return_cb(driver->connection, noit_rabbitmq_brcb, driver);
@@ -229,9 +243,11 @@ static int noit_rabbimq_connect(iep_thread_driver_t *dr) {
                    AMQP_SASL_METHOD_PLAIN,
                    driver->username, driver->password);
     if(r.reply_type != AMQP_RESPONSE_NORMAL) {
-      noitL(noit_error, "AMQP login failed\n");
+      mtevL(mtev_error, "AMQP login failed\n");
       amqp_connection_close(driver->connection, AMQP_REPLY_SUCCESS);
       amqp_destroy_connection(driver->connection);
+      if(driver->sockfd >= 0) close(driver->sockfd);
+      driver->sockfd = -1;
       driver->connection = NULL;
       return -1;
     }
@@ -239,9 +255,11 @@ static int noit_rabbimq_connect(iep_thread_driver_t *dr) {
     amqp_channel_open(driver->connection, 1);
     rptr = amqp_get_rpc_reply();
     if(rptr->reply_type != AMQP_RESPONSE_NORMAL) {
-      noitL(noit_error, "AMQP channe_open failed\n");
+      mtevL(mtev_error, "AMQP channe_open failed\n");
       amqp_connection_close(driver->connection, AMQP_REPLY_SUCCESS);
       amqp_destroy_connection(driver->connection);
+      if(driver->sockfd >= 0) close(driver->sockfd);
+      driver->sockfd = -1;
       driver->connection = NULL;
       return -1;
     }
@@ -331,6 +349,7 @@ noit_rabbimq_submit(iep_thread_driver_t *dr,
   if(*payload == 'M' ||
      *payload == 'S' ||
      *payload == 'C' ||
+     (*payload == 'F' && payload[1] == '1') ||
      (*payload == 'B' && (payload[1] == '1' || payload[1] == '2'))) {
     char uuid_str[32 * 2 + 1];
     int account_id, check_id;
@@ -340,8 +359,9 @@ noit_rabbimq_submit(iep_thread_driver_t *dr,
         char *replace;
         int newlen = strlen(driver->routingkey) + 1 + sizeof(uuid_str) + 2 * 32;
         replace = alloca(newlen);
-        snprintf(replace, newlen, "%s.%d.%d%s", driver->routingkey,
-                 account_id, check_id, uuid_str);
+        snprintf(replace, newlen, "%s.%x.%x.%d.%d%s", driver->routingkey,
+                 account_id%16, (account_id/16)%16, account_id,
+                 check_id, uuid_str);
         routingkey = replace;
       }
     }
@@ -351,9 +371,11 @@ noit_rabbimq_submit(iep_thread_driver_t *dr,
                           amqp_cstring_bytes(routingkey),
                           1, 0, NULL, body);
   if(rv < 0) {
-    noitL(noit_error, "AMQP publish failed, disconnecting\n");
+    mtevL(mtev_error, "AMQP publish failed, disconnecting\n");
     amqp_connection_close(driver->connection, AMQP_REPLY_SUCCESS);
     amqp_destroy_connection(driver->connection);
+    if(driver->sockfd >= 0) close(driver->sockfd);
+    driver->sockfd = -1;
     driver->connection = NULL;
     return -1;
   }
@@ -364,6 +386,8 @@ noit_rabbimq_submit(iep_thread_driver_t *dr,
   if(driver->has_error) {
     amqp_connection_close(driver->connection, AMQP_REPLY_SUCCESS);
     amqp_destroy_connection(driver->connection);
+    if(driver->sockfd >= 0) close(driver->sockfd);
+    driver->sockfd = -1;
     driver->connection = NULL;
     return -1;
   }
@@ -378,17 +402,22 @@ mq_driver_t mq_driver_rabbitmq = {
   noit_rabbimq_deallocate
 };
 
-static int noit_rabbimq_driver_config(noit_module_generic_t *self, noit_hash_table *o) {
+static int noit_rabbimq_driver_config(mtev_dso_generic_t *self, mtev_hash_table *o) {
+  const char *intstr;
+  if(mtev_hash_retr_str(o, "sndbuf", strlen("sndbuf"), &intstr))
+    desired_sndbuf = atoi(intstr);
+  if(mtev_hash_retr_str(o, "rcvbuf", strlen("rcvbuf"), &intstr))
+    desired_rcvbuf = atoi(intstr);
   return 0;
 }
-static int noit_rabbimq_driver_onload(noit_image_t *self) {
+static int noit_rabbimq_driver_onload(mtev_image_t *self) {
   return 0;
 }
 
 static int
-noit_console_show_rabbitmq(noit_console_closure_t ncct,
+noit_console_show_rabbitmq(mtev_console_closure_t ncct,
                            int argc, char **argv,
-                           noit_console_state_t *dstate,
+                           mtev_console_state_t *dstate,
                            void *closure) {
   int i;
   nc_printf(ncct, " == RabbitMQ ==\n");
@@ -403,7 +432,7 @@ noit_console_show_rabbitmq(noit_console_closure_t ncct,
     struct amqp_driver *dr;
     if(!stats.thread_states[i].owner) continue;
     dr = &stats.thread_states[i];
-    nc_printf(ncct, "   == connection: %p ==\n", (void *)dr->owner);
+    nc_printf(ncct, "   == connection: %p ==\n", (void *)(vpsized_int)dr->owner);
     if(dr->connection)
       nc_printf(ncct, "     %s@%s:%d (vhost: %s, exchange: %s)\n",
                 dr->username, dr->hostname[dr->hostidx], dr->port, dr->vhost,
@@ -417,17 +446,17 @@ noit_console_show_rabbitmq(noit_console_closure_t ncct,
 
 static void
 register_console_rabbitmq_commands() {
-  noit_console_state_t *tl;
+  mtev_console_state_t *tl;
   cmd_info_t *showcmd;
 
-  tl = noit_console_state_initial();
-  showcmd = noit_console_state_get_cmd(tl, "show");
+  tl = mtev_console_state_initial();
+  showcmd = mtev_console_state_get_cmd(tl, "show");
   assert(showcmd && showcmd->dstate);
-  noit_console_state_add_cmd(showcmd->dstate,
+  mtev_console_state_add_cmd(showcmd->dstate,
     NCSCMD("rabbitmq", noit_console_show_rabbitmq, NULL, NULL, NULL));
 }
 
-static int noit_rabbimq_driver_init(noit_module_generic_t *self) {
+static int noit_rabbimq_driver_init(mtev_dso_generic_t *self) {
   pthread_mutex_init(&driver_lock, NULL);
   memset(&stats, 0, sizeof(stats));
   stratcon_iep_mq_driver_register("rabbitmq", &mq_driver_rabbitmq);
@@ -435,14 +464,14 @@ static int noit_rabbimq_driver_init(noit_module_generic_t *self) {
   return 0;
 }
 
-noit_module_generic_t rabbitmq_driver = {
+mtev_dso_generic_t rabbitmq_driver = {
   {
-    NOIT_GENERIC_MAGIC,
-    NOIT_GENERIC_ABI_VERSION,
-    "rabbitmq_driver",
-    "AMQP driver for IEP MQ submission",
-    rabbitmq_driver_xml_description,
-    noit_rabbimq_driver_onload
+    .magic = MTEV_GENERIC_MAGIC,
+    .version = MTEV_GENERIC_ABI_VERSION,
+    .name = "rabbitmq_driver",
+    .description = "AMQP driver for IEP MQ submission",
+    .xml_description = rabbitmq_driver_xml_description,
+    .onload = noit_rabbimq_driver_onload
   },
   noit_rabbimq_driver_config,
   noit_rabbimq_driver_init

@@ -63,6 +63,9 @@ SL checks).</parameter>
     <parameter name="ciphers"
                required="optional"
                allowed=".+">A list of ciphers to be used in the SSL protocol (for SSL checks).</parameter>
+    <parameter name="header_Host"
+               required="optional"
+               allowed=".+">The host header to validate against the SSL certificate (for SSL checks).</parameter>
   </checkconfig>
   <examples>
     <example>
@@ -119,6 +122,7 @@ function elapsed(check, name, starttime, endtime)
 end
 
 function initiate(module, check)
+  local config = check.interpolate(check.config)
   local starttime = noit.timeval.now()
   local max_len = 80
   check.bad()
@@ -127,30 +131,38 @@ function initiate(module, check)
   local good = false
   local status = ""
   local use_ssl = false
+  local host_header = config.header_Host or ''
 
-  if check.config.port == nil then
+  if config.port == nil then
     check.status("port is not specified")
     return
   end
 
   -- SSL
-  if check.config.use_ssl == "true" or check.config.use_ssl == "on" then
+  if config.use_ssl == "true" or config.use_ssl == "on" then
     use_ssl = true
   end
 
   local e = noit.socket(check.target_ip)
-  local rv, err = e:connect(check.target_ip, check.config.port)
+  local rv, err = e:connect(check.target_ip, config.port)
 
   if rv ~= 0 then
     check.status(err or "connect error")
     return
   end
 
+  local ca_chain = 
+     noit.conf_get_string("/noit/eventer/config/default_ca_chain")
+
+  if config.ca_chain ~= nil and config.ca_chain ~= '' then
+    ca_chain = config.ca_chain
+  end
+
   if use_ssl == true then
-    rv, err = e:ssl_upgrade_socket(check.config.certificate_file,
-                                        check.config.key_file,
-                                        check.config.ca_chain,
-                                        check.config.ciphers)
+    rv, err = e:ssl_upgrade_socket(config.certificate_file,
+                                        config.key_file,
+                                        ca_chain,
+                                        config.ciphers)
   end 
 
   local connecttime = noit.timeval.now()
@@ -167,10 +179,23 @@ function initiate(module, check)
   -- ssl metrics
   local ssl_ctx = e:ssl_ctx()
   if ssl_ctx ~= nil then
+    local header_match_error = nil
+    if host_header ~= '' then
+      header_match_error = noit.extras.check_host_header_against_certificate(host_header, ssl_ctx.subject, ssl_ctx.san_list)
+    end
     if ssl_ctx.error ~= nil then status = status .. ',sslerror' end
-    check.metric_string("cert_error", ssl_ctx.error)
+    if header_match_error == nil then
+      check.metric_string("cert_error", ssl_ctx.error)
+    elseif ssl_ctx.error == nil then
+      check.metric_string("cert_error", header_match_error)
+    else
+      check.metric_string("cert_error", ssl_ctx.error .. ', ' .. header_match_error)
+    end
     check.metric_string("cert_issuer", ssl_ctx.issuer)
     check.metric_string("cert_subject", ssl_ctx.subject)
+    if ssl_ctx.san_list ~= nil then
+      check.metric_string("cert_subject_alternative_names", ssl_ctx.san_list)
+    end
     check.metric_uint32("cert_start", ssl_ctx.start_time)
     check.metric_uint32("cert_end", ssl_ctx.end_time)
     check.metric_int32("cert_end_in", ssl_ctx.end_time - os.time())
@@ -180,8 +205,8 @@ function initiate(module, check)
     end
   end
 
-  if check.config.send_body ~= nil then
-    if e:write(check.config.send_body) < 0 then
+  if config.send_body ~= nil then
+    if e:write(config.send_body) < 0 then
       check.bad()
       check.status("send_body: received hangup")
       return
@@ -189,12 +214,16 @@ function initiate(module, check)
   end
 
   -- match banner
-  if check.config.banner_match ~= nil then
+  if config.banner_match ~= nil then
     str = e:read("\n")
+    if str == nil then
+      check.status("could not read banner")
+      return
+    end
     local firstbytetime = noit.timeval.now()
     elapsed(check, "tt_firstbyte", starttime, firstbytetime)
 
-    local bannerre = noit.pcre(check.config.banner_match)
+    local bannerre = noit.pcre(config.banner_match)
     if bannerre ~= nil then
       local rv, m, m1 = bannerre(str)
       if rv then
@@ -207,6 +236,7 @@ function initiate(module, check)
       else
         good = false
         status = status .. ',banner_match=failed'
+        check.metric_string('banner_match','')
       end
     end
     if string.len(str) > max_len then
@@ -216,7 +246,7 @@ function initiate(module, check)
   end
 
   -- match body
-  if check.config.body_match ~= nil then
+  if config.body_match ~= nil then
     str = e:read(1024)
     if str == nil then
       check.status("bad body length " .. (str and str:len() or "0"))
@@ -225,7 +255,7 @@ function initiate(module, check)
     local bodybytetime = noit.timeval.now()
     elapsed(check, "tt_body", starttime, bodybytetime)
 
-    local exre = noit.pcre(check.config.body_match)
+    local exre = noit.pcre(config.body_match)
     local rv = true
     local found = false
     local m = nil

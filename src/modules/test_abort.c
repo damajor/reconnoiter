@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007-2010, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,7 +31,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
+#include <mtev_defines.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -38,11 +39,12 @@
 #include <assert.h>
 #include <math.h>
 
+#include <mtev_hash.h>
+
 #include "noit_module.h"
 #include "noit_check.h"
 #include "noit_check_tools.h"
-#include "utils/noit_log.h"
-#include "utils/noit_hash.h"
+#include "noit_mtev_bridge.h"
 
 #ifndef BOOLOID
 #define BOOLOID                  16
@@ -76,8 +78,8 @@ typedef struct {
   int ignore_signals;
 } test_abort_check_info_t;
 
-static noit_log_stream_t nlerr = NULL;
-static noit_log_stream_t nldeb = NULL;
+static mtev_log_stream_t nlerr = NULL;
+static mtev_log_stream_t nldeb = NULL;
 
 static void test_abort_cleanup(noit_module_t *self, noit_check_t *check) {
   test_abort_check_info_t *ci = check->closure;
@@ -98,21 +100,19 @@ static int test_abort_drive_session(eventer_t e, int mask, void *closure,
     /* this case is impossible from the eventer.  It is called as
      * such on the synchronous completion of the event.
      */
-    stats_t current;
-    noit_check_stats_clear(&current);
-    current.available = NP_AVAILABLE;
-    current.state = ci->timed_out ? NP_BAD : NP_GOOD;
-    noitL(nlerr, "test_abort: EVENTER_READ | EVENTER_WRITE\n");
-    noit_check_set_stats(ci->self, check, &current);
+    noit_stats_set_available(check, NP_AVAILABLE);
+    noit_stats_set_state(check, ci->timed_out ? NP_BAD : NP_GOOD);
+    mtevL(nlerr, "test_abort: EVENTER_READ | EVENTER_WRITE\n");
+    noit_check_set_stats(check);
     check->flags &= ~NP_RUNNING;
     return 0;
   }
   switch(mask) {
     case EVENTER_ASYNCH_WORK:
-      noitL(nlerr, "test_abort: EVENTER_ASYNCH_WORK\n");
+      mtevL(nlerr, "test_abort: EVENTER_ASYNCH_WORK\n");
       r = modf(ci->timeout, &i);
       ci->timed_out = 1;
-      
+
       if(ci->ignore_signals) { /* compuational loop */
         double trash = 1.0;
         gettimeofday(&now, NULL);
@@ -136,13 +136,13 @@ static int test_abort_drive_session(eventer_t e, int mask, void *closure,
         rqtp.tv_nsec = (int)(r * 1000000000.0);
         nanosleep(&rqtp,NULL);
       }
-      noitL(nlerr, "test_abort: EVENTER_ASYNCH_WORK (done)\n");
+      mtevL(nlerr, "test_abort: EVENTER_ASYNCH_WORK (done)\n");
       ci->timed_out = 0;
       return 0;
       break;
     case EVENTER_ASYNCH_CLEANUP:
       /* This sets us up for a completion call. */
-      noitL(nlerr, "test_abort: EVENTER_ASYNCH_CLEANUP\n");
+      mtevL(nlerr, "test_abort: EVENTER_ASYNCH_CLEANUP\n");
       e->mask = EVENTER_READ | EVENTER_WRITE;
       break;
     default:
@@ -157,29 +157,30 @@ static int test_abort_initiate(noit_module_t *self, noit_check_t *check,
   struct timeval __now;
   const char *v;
 
-  noitL(nlerr, "test_abort_initiate\n");
+  mtevL(nlerr, "test_abort_initiate\n");
   /* We cannot be running */
-  assert(!(check->flags & NP_RUNNING));
+  BAIL_ON_RUNNING_CHECK(check);
   check->flags |= NP_RUNNING;
 
   ci->self = self;
   ci->check = check;
   ci->timeout = 30;
-  if(noit_hash_retr_str(check->config, "sleep", strlen("sleep"), &v)) {
+  if(mtev_hash_retr_str(check->config, "sleep", strlen("sleep"), &v)) {
     ci->timeout = atof(v);
   }
   ci->ignore_signals = 0;
-  if(noit_hash_retr_str(check->config, "ignore_signals", strlen("ignore_signals"), &v)) {
+  if(mtev_hash_retr_str(check->config, "ignore_signals", strlen("ignore_signals"), &v)) {
     if(!strcmp(v, "true")) ci->ignore_signals = 1;
   }
   ci->timed_out = 1;
 
   ci->method = 0;
-  if(noit_hash_retr_str(check->config, "method", strlen("method"), &v)) {
+  if(mtev_hash_retr_str(check->config, "method", strlen("method"), &v)) {
     if(!strcmp(v, "evil")) ci->method = EVENTER_EVIL_BRUTAL;
     else if(!strcmp(v, "deferred")) ci->method = EVENTER_CANCEL_DEFERRED;
     else if(!strcmp(v, "asynch")) ci->method = EVENTER_CANCEL_ASYNCH;
   }
+  gettimeofday(&__now, NULL);
   memcpy(&check->last_fire_time, &__now, sizeof(__now));
 
   /* Register a handler for the worker */
@@ -194,9 +195,9 @@ static int test_abort_initiate_check(noit_module_t *self, noit_check_t *check,
   return 0;
 }
 
-static int test_abort_onload(noit_image_t *self) {
-  nlerr = noit_log_stream_find("error/test_abort");
-  nldeb = noit_log_stream_find("debug/test_abort");
+static int test_abort_onload(mtev_image_t *self) {
+  nlerr = mtev_log_stream_find("error/test_abort");
+  nldeb = mtev_log_stream_find("debug/test_abort");
   if(!nlerr) nlerr = noit_stderr;
   if(!nldeb) nldeb = noit_debug;
 
@@ -206,12 +207,12 @@ static int test_abort_onload(noit_image_t *self) {
 
 noit_module_t test_abort = {
   {
-    NOIT_MODULE_MAGIC,
-    NOIT_MODULE_ABI_VERSION,
-    "test_abort",
-    "test_abort internal tool for eventer testing",
-    "",
-    test_abort_onload
+    .magic = NOIT_MODULE_MAGIC,
+    .version = NOIT_MODULE_ABI_VERSION,
+    .name = "test_abort",
+    .description = "test_abort internal tool for eventer testing",
+    .xml_description = "",
+    .onload = test_abort_onload
   },
   NULL,
   NULL,

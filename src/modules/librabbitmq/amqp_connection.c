@@ -1,8 +1,10 @@
+/* MOZILLA PUBLIC LICENSE Version 1.1 -- see LICENSE-MPL-RabbitMQ */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <mtev_log.h>
 
 #include <unistd.h>
 #include <sys/uio.h>
@@ -27,6 +29,8 @@
 		_check_state->state);					\
   }
 
+static unsigned char frame_end_byte = AMQP_FRAME_END;
+
 amqp_connection_state_t amqp_new_connection(void) {
   amqp_connection_state_t state =
     (amqp_connection_state_t) calloc(1, sizeof(struct amqp_connection_state_t_));
@@ -43,9 +47,6 @@ amqp_connection_state_t amqp_new_connection(void) {
   state->inbound_buffer.bytes = NULL;
   state->outbound_buffer.bytes = NULL;
   if (amqp_tune_connection(state, 0, INITIAL_FRAME_POOL_PAGE_SIZE, 0) != 0) {
-    empty_amqp_pool(&state->frame_pool);
-    empty_amqp_pool(&state->decoding_pool);
-    free(state);
     return NULL;
   }
 
@@ -374,25 +375,38 @@ static int inner_send_frame(amqp_connection_state_t state,
 int amqp_send_frame(amqp_connection_state_t state,
 		    amqp_frame_t const *frame)
 {
-  amqp_bytes_t encoded;
+  amqp_bytes_t encoded = { .len = 0, .bytes = NULL };
   int payload_len;
   int separate_body;
+  int err;
 
   separate_body = inner_send_frame(state, frame, &encoded, &payload_len);
   switch (separate_body) {
     case 0:
-      (void)AMQP_CHECK_RESULT(write(state->sockfd,
-			      state->outbound_buffer.bytes,
-			      payload_len + (HEADER_SIZE + FOOTER_SIZE)));
+      err = eintr_safe_write(state->sockfd, state->outbound_buffer.bytes,
+			     payload_len + (HEADER_SIZE + FOOTER_SIZE));
+      if (err < 0) {
+        mtevL(mtev_error, "Error writing %d bytes in amqp_send_frame (separate body: false)\n", 
+              payload_len + (HEADER_SIZE + FOOTER_SIZE));
+        return err;
+      }
       return 0;
 
     case 1:
-      (void)AMQP_CHECK_RESULT(write(state->sockfd, state->outbound_buffer.bytes, HEADER_SIZE));
-      (void)AMQP_CHECK_RESULT(write(state->sockfd, encoded.bytes, payload_len));
-      {
-	assert(FOOTER_SIZE == 1);
-	unsigned char frame_end_byte = AMQP_FRAME_END;
-	(void)AMQP_CHECK_RESULT(write(state->sockfd, &frame_end_byte, FOOTER_SIZE));
+      err = eintr_safe_write(state->sockfd, state->outbound_buffer.bytes, HEADER_SIZE);
+      if (err < 0) {
+        mtevL(mtev_error, "Error writing header in amqp_send_frame, size %d\n", HEADER_SIZE);
+        return err;
+      }
+      err = eintr_safe_write(state->sockfd, encoded.bytes, payload_len);
+      if (err < 0) {
+        mtevL(mtev_error, "Error writing body in amqp_send_frame, size %d\n", payload_len);
+        return err;
+      }
+      err = eintr_safe_write(state->sockfd, &frame_end_byte, FOOTER_SIZE);
+      if (err < 0) {
+        mtevL(mtev_error, "Error writing footer in amqp_send_frame, size %d\n", FOOTER_SIZE);
+        return err;
       }
       return 0;
 
@@ -406,7 +420,7 @@ int amqp_send_frame_to(amqp_connection_state_t state,
 		       amqp_output_fn_t fn,
 		       void *context)
 {
-  amqp_bytes_t encoded;
+  amqp_bytes_t encoded = { .len = 0, .bytes = NULL };
   int payload_len;
   int separate_body;
 
@@ -421,11 +435,7 @@ int amqp_send_frame_to(amqp_connection_state_t state,
     case 1:
       (void)AMQP_CHECK_RESULT(fn(context, state->outbound_buffer.bytes, HEADER_SIZE));
       (void)AMQP_CHECK_RESULT(fn(context, encoded.bytes, payload_len));
-      {
-	assert(FOOTER_SIZE == 1);
-	unsigned char frame_end_byte = AMQP_FRAME_END;
-	(void)AMQP_CHECK_RESULT(fn(context, &frame_end_byte, FOOTER_SIZE));
-      }
+      (void)AMQP_CHECK_RESULT(fn(context, &frame_end_byte, FOOTER_SIZE));
       return 0;
 
     default:

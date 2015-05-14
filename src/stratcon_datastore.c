@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007-2009, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,19 +31,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
-#include "eventer/eventer.h"
-#include "utils/noit_log.h"
-#include "utils/noit_b64.h"
-#include "utils/noit_str.h"
-#include "utils/noit_mkdir.h"
-#include "utils/noit_getip.h"
-#include "stratcon_datastore.h"
-#include "stratcon_realtime_http.h"
-#include "stratcon_iep.h"
-#include "noit_conf.h"
-#include "noit_check.h"
-#include "noit_rest.h"
+#include <mtev_defines.h>
+
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -54,10 +44,26 @@
 #include <assert.h>
 #include <errno.h>
 
-static noit_log_stream_t ds_err = NULL;
-static noit_log_stream_t ds_deb = NULL;
-static noit_log_stream_t ds_pool_deb = NULL;
-static noit_log_stream_t ingest_err = NULL;
+#include <eventer/eventer.h>
+#include <mtev_conf.h>
+#include <mtev_rest.h>
+#include <mtev_log.h>
+#include <mtev_b64.h>
+#include <mtev_str.h>
+#include <mtev_mkdir.h>
+#include <mtev_getip.h>
+
+#include "noit_mtev_bridge.h"
+#include "stratcon_datastore.h"
+#include "stratcon_ingest.h"
+#include "stratcon_realtime_http.h"
+#include "stratcon_iep.h"
+#include "noit_check.h"
+
+static mtev_log_stream_t ds_err = NULL;
+static mtev_log_stream_t ds_deb = NULL;
+static mtev_log_stream_t ds_pool_deb = NULL;
+static mtev_log_stream_t ingest_err = NULL;
 static char *basejpath = NULL;
 
 static ingestor_api_t *ingestor = NULL;
@@ -90,11 +96,11 @@ static struct datastore_onlooker_list {
 } *onlookers = NULL;
 
 typedef struct {
-  noit_hash_table *ws;
+  mtev_hash_table *ws;
   eventer_t completion;
 } syncset_t;
 
-noit_hash_table working_sets;
+mtev_hash_table working_sets;
 
 static void
 interim_journal_free(void *vij) {
@@ -104,75 +110,6 @@ interim_journal_free(void *vij) {
   if(ij->remote_cn) free(ij->remote_cn);
   if(ij->fqdn) free(ij->fqdn);
   free(ij);
-}
-
-static void
-stratcon_ingest_sweep_journals_int(char *first, char *second, char *third,
-                                   int (*test)(const char *),
-                                   int (*ingest)(const char *fullpath,
-                                                 const char *remote_str,
-                                                 const char *remote_cn,
-                                                 const char *id_str)) {
-  char path[PATH_MAX];
-  DIR *root;
-  struct dirent *de, *entry;
-  int i = 0, cnt = 0;
-  char **entries;
-  int size = 0;
-
-  snprintf(path, sizeof(path), "%s%s%s%s%s%s%s", basejpath,
-           first ? "/" : "", first ? first : "",
-           second ? "/" : "", second ? second : "",
-           third ? "/" : "", third ? third : "");
-#ifdef _PC_NAME_MAX
-  size = pathconf(path, _PC_NAME_MAX);
-#endif
-  size = MAX(size, PATH_MAX + 128);
-  de = alloca(size);
-  root = opendir(path);
-  if(!root) return;
-  while(portable_readdir_r(root, de, &entry) == 0 && entry != NULL) cnt++;
-  closedir(root);
-  root = opendir(path);
-  if(!root) return;
-  entries = malloc(sizeof(*entries) * cnt);
-  while(portable_readdir_r(root, de, &entry) == 0 && entry != NULL) {
-    if(i < cnt) {
-      entries[i++] = strdup(entry->d_name);
-    }
-  }
-  closedir(root);
-  cnt = i; /* could have changed, directories are fickle */
-  qsort(entries, i, sizeof(*entries),
-        (int (*)(const void *, const void *))strcasecmp);
-  for(i=0; i<cnt; i++) {
-    if(!strcmp(entries[i], ".") || !strcmp(entries[i], "..")) continue;
-    noitL(ds_deb, "Processing L%d entry '%s'\n",
-          third ? 4 : second ? 3 : first ? 2 : 1, entries[i]);
-    if(!first)
-      stratcon_ingest_sweep_journals_int(entries[i], NULL, NULL, test, ingest);
-    else if(!second)
-      stratcon_ingest_sweep_journals_int(first, entries[i], NULL, test, ingest);
-    else if(!third)
-      stratcon_ingest_sweep_journals_int(first, second, entries[i], test, ingest);
-    else if(test(entries[i])) {
-      char fullpath[PATH_MAX];
-      snprintf(fullpath, sizeof(fullpath), "%s/%s/%s/%s/%s", basejpath,
-               first,second,third,entries[i]);
-      ingest(fullpath,first,second,third);
-    }
-  }
-  for(i=0; i<cnt; i++)
-    free(entries[i]);
-  free(entries);
-}
-void
-stratcon_ingest_sweep_journals(int (*test)(const char *),
-                               int (*ingest)(const char *fullpath,
-                                             const char *remote_str,
-                                             const char *remote_cn,
-                                             const char *id_str)) {
-  stratcon_ingest_sweep_journals_int(NULL,NULL,NULL, test, ingest);
 }
 
 static int
@@ -192,7 +129,7 @@ stratcon_ingest(const char *fullpath, const char *remote_str,
 static int
 stratcon_datastore_journal_sync(eventer_t e, int mask, void *closure,
                                 struct timeval *now) {
-  noit_hash_iter iter = NOIT_HASH_ITER_ZERO;
+  mtev_hash_iter iter = MTEV_HASH_ITER_ZERO;
   const char *k;
   int klen;
   void *vij;
@@ -209,44 +146,52 @@ stratcon_datastore_journal_sync(eventer_t e, int mask, void *closure,
   }
   if(!((mask & EVENTER_ASYNCH_WORK) == EVENTER_ASYNCH_WORK)) return 0;
 
-  noitL(ds_deb, "Syncing journal sets...\n");
-  while(noit_hash_next(syncset->ws, &iter, &k, &klen, &vij)) {
-    char tmppath[PATH_MAX], id_str[32];
-    int suffix_idx;
-    ij = vij;
-    noitL(ds_deb, "Syncing journal set [%s,%s,%s]\n",
-          ij->remote_str, ij->remote_cn, ij->fqdn);
-    strlcpy(tmppath, ij->filename, sizeof(tmppath));
-    suffix_idx = strlen(ij->filename) - 4; /* . t m p */
-    ij->filename[suffix_idx] = '\0';
-    if(rename(tmppath, ij->filename) != 0) {
-      if(errno == EEXIST) {
-        unlink(ij->filename);
-        if(rename(tmppath, ij->filename) != 0) goto rename_failed;
+  mtevL(ds_deb, "Syncing journal sets...\n");
+  if (syncset->ws) {
+    while(mtev_hash_next(syncset->ws, &iter, &k, &klen, &vij)) {
+      char tmppath[PATH_MAX], id_str[32];
+      int suffix_idx;
+      ij = vij;
+      mtevL(ds_deb, "Syncing journal set [%s,%s,%s]\n",
+            ij->remote_str, ij->remote_cn, ij->fqdn);
+      strlcpy(tmppath, ij->filename, sizeof(tmppath));
+      suffix_idx = strlen(ij->filename) - 4; /* . t m p */
+      ij->filename[suffix_idx] = '\0';
+      if(rename(tmppath, ij->filename) != 0) {
+        if(errno == EEXIST) {
+          unlink(ij->filename);
+          if(rename(tmppath, ij->filename) != 0) goto rename_failed;
+        }
+        else {
+         rename_failed:
+          mtevL(noit_error, "rename failed(%s): (%s->%s)\n", strerror(errno),
+                tmppath, ij->filename);
+          exit(-1);
+        }
       }
-      else {
-       rename_failed:
-        noitL(noit_error, "rename failed(%s): (%s->%s)\n", strerror(errno),
-              tmppath, ij->filename);
-        exit(-1);
+      if(ij->fd >= 0) {
+        fsync(ij->fd);
+        close(ij->fd);
       }
+      ij->fd = -1;
+      snprintf(id_str, sizeof(id_str), "%d", ij->storagenode_id);
+      stratcon_ingest(ij->filename, ij->remote_str,
+                      ij->remote_cn, id_str);
     }
-    fsync(ij->fd);
-    close(ij->fd);
-    ij->fd = -1;
-    snprintf(id_str, sizeof(id_str), "%d", ij->storagenode_id);
-    stratcon_ingest(ij->filename, ij->remote_str,
-                    ij->remote_cn, id_str);
+    mtev_hash_destroy(syncset->ws, free, interim_journal_free);
+    free(syncset->ws);
   }
-  noit_hash_destroy(syncset->ws, free, interim_journal_free);
-  free(syncset->ws);
+  else {
+    mtevL(noit_error, "attempted to sync non-existing working set\n");
+  }
+
   return 0;
 }
 static interim_journal_t *
 interim_journal_get(struct sockaddr *remote, const char *remote_cn_in,
                     int storagenode_id, const char *fqdn_in) {
   void *vhash, *vij;
-  noit_hash_table *working_set;
+  mtev_hash_table *working_set;
   interim_journal_t *ij;
   struct timeval now;
   char jpath[PATH_MAX];
@@ -254,20 +199,20 @@ interim_journal_get(struct sockaddr *remote, const char *remote_cn_in,
   const char *remote_cn = remote_cn_in ? remote_cn_in : "default";
   const char *fqdn = fqdn_in ? fqdn_in : "default";
 
-  noit_convert_sockaddr_to_buff(remote_str, sizeof(remote_str), remote);
+  mtev_convert_sockaddr_to_buff(remote_str, sizeof(remote_str), remote);
   if(!*remote_str) strlcpy(remote_str, "default", sizeof(remote_str));
 
   /* Lookup the working set */
-  if(!noit_hash_retrieve(&working_sets, remote_cn, strlen(remote_cn), &vhash)) {
+  if(!mtev_hash_retrieve(&working_sets, remote_cn, strlen(remote_cn), &vhash)) {
     working_set = calloc(1, sizeof(*working_set));
-    noit_hash_store(&working_sets, strdup(remote_cn), strlen(remote_cn),
+    mtev_hash_store(&working_sets, strdup(remote_cn), strlen(remote_cn),
                     working_set);
   }
   else
     working_set = vhash;
 
   /* Lookup the interim journal within the working set */
-  if(!noit_hash_retrieve(working_set, fqdn, strlen(fqdn), &vij)) {
+  if(!mtev_hash_retrieve(working_set, fqdn, strlen(fqdn), &vij)) {
     ij = calloc(1, sizeof(*ij));
     gettimeofday(&now, NULL);
     snprintf(jpath, sizeof(jpath), "%s/%s/%s/%d/%08x%08x.tmp",
@@ -281,7 +226,7 @@ interim_journal_get(struct sockaddr *remote, const char *remote_cn_in,
     ij->fd = open(ij->filename, O_RDWR | O_CREAT | O_EXCL, 0640);
     if(ij->fd < 0 && errno == ENOENT) {
       if(mkdir_for_file(ij->filename, 0750)) {
-        noitL(noit_error, "Failed to create dir for '%s': %s\n",
+        mtevL(noit_error, "Failed to create dir for '%s': %s\n",
               ij->filename, strerror(errno));
         exit(-1);
       }
@@ -293,11 +238,11 @@ interim_journal_get(struct sockaddr *remote, const char *remote_cn_in,
       ij->fd = open(ij->filename, O_RDWR | O_CREAT | O_EXCL, 0640);
     }
     if(ij->fd < 0) {
-      noitL(noit_error, "Failed to open interim journal '%s': %s\n",
+      mtevL(noit_error, "Failed to open interim journal '%s': %s\n",
             ij->filename, strerror(errno));
       exit(-1);
     }
-    noit_hash_store(working_set, strdup(fqdn), strlen(fqdn), ij);
+    mtev_hash_store(working_set, strdup(fqdn), strlen(fqdn), ij);
   }
   else
     ij = vij;
@@ -313,13 +258,16 @@ stratcon_datastore_journal(struct sockaddr *remote,
   const char *fqdn = NULL, *dsn = NULL;
   int storagenode_id = 0;
   uuid_t checkid;
-  if(!line) return;
+  if(!line) {
+    mtevL(noit_error, "Error: Line not found for %s in stratcon_datastore_journal\n", remote_cn);
+    return;
+  }
   cp1 = strchr(line, '\t');
+  *rtype = '\0';
   if(cp1 && cp1 - line < sizeof(rtype) - 1) {
     memcpy(rtype, line, cp1 - line);
     rtype[cp1 - line] = '\0';
   }
-  else rtype[0] = '\0';
   /* if it is a UUID based thing, find the storage node */
   switch(*rtype) {
     case 'C':
@@ -327,6 +275,7 @@ stratcon_datastore_journal(struct sockaddr *remote,
     case 'M':
     case 'D':
     case 'B':
+    case 'H':
       if((cp1 = strchr(cp1+1, '\t')) != NULL &&
          (cp2 = strchr(cp1+1, '\t')) != NULL &&
          (cp2-cp1 >= UUID_STR_LEN)) {
@@ -343,34 +292,34 @@ stratcon_datastore_journal(struct sockaddr *remote,
       ij = interim_journal_get(remote,remote_cn,0,NULL);
       break;
     default:
+      mtevL(noit_error, "Error: Line has bad type for %s in stratcon_datastore_journal (%s)\n", remote_cn, line);
       break;
   }
   if(!ij) {
-    noitL(ingest_err, "%d\t%s\n", storagenode_id, line);
+    mtevL(ingest_err, "%d\t%s\n", storagenode_id, line);
   }
   else {
     int len;
     len = write(ij->fd, line, strlen(line));
     if(len < 0) {
-      noitL(noit_error, "write to %s failed: %s\n",
+      mtevL(noit_error, "write to %s failed: %s\n",
             ij->filename, strerror(errno));
     }
   }
   free(line);
   return;
 }
-static noit_hash_table *
+static mtev_hash_table *
 stratcon_datastore_journal_remove(struct sockaddr *remote,
                                   const char *remote_cn) {
   void *vhash = NULL;
-  if(noit_hash_retrieve(&working_sets, remote_cn, strlen(remote_cn), &vhash)) {
+  if(mtev_hash_retrieve(&working_sets, remote_cn, strlen(remote_cn), &vhash)) {
     /* pluck it out */
-    noit_hash_delete(&working_sets, remote_cn, strlen(remote_cn), free, NULL);
+    mtev_hash_delete(&working_sets, remote_cn, strlen(remote_cn), free, NULL);
   }
   else {
-    noitL(noit_error, "attempted checkpoint on non-existing workingset: '%s'\n",
+    mtevL(noit_error, "attempted checkpoint on non-existing workingset: '%s'\n",
           remote_cn);
-    abort();
   }
   return vhash;
 }
@@ -417,20 +366,20 @@ stratcon_datastore_register_onlooker(void (*f)(stratcon_datastore_op_t,
   nnode = calloc(1, sizeof(*nnode));
   nnode->dispatch = f;
   nnode->next = onlookers;
-  while(noit_atomic_casptr(vonlookers,
+  while(mtev_atomic_casptr(vonlookers,
                            nnode, nnode->next) != (void *)nnode->next)
     nnode->next = onlookers;
 }
 
 static int
-rest_get_noit_config(noit_http_rest_closure_t *restc,
+rest_get_noit_config(mtev_http_rest_closure_t *restc,
                      int npats, char **pats) {
-  noit_http_session_ctx *ctx = restc->http_ctx;
+  mtev_http_session_ctx *ctx = restc->http_ctx;
   char *xml = NULL;
 
   if(npats != 0) {
-    noit_http_response_server_error(ctx, "text/xml");
-    noit_http_response_end(ctx);
+    mtev_http_response_server_error(ctx, "text/xml");
+    mtev_http_response_end(ctx);
     return 0;
   }
 
@@ -441,26 +390,34 @@ rest_get_noit_config(noit_http_rest_closure_t *restc,
     snprintf(buff, sizeof(buff), "<error><remote_cn>%s</remote_cn>"
                                  "<row_count>%d</row_count></error>\n",
              restc->remote_cn, 0);
-    noit_http_response_append(ctx, buff, strlen(buff));
-    noit_http_response_not_found(ctx, "text/xml");
+    mtev_http_response_append(ctx, buff, strlen(buff));
+    mtev_http_response_not_found(ctx, "text/xml");
   }
   else {
-    noit_http_response_append(ctx, xml, strlen(xml));
-    noit_http_response_ok(ctx, "text/xml");
+    mtev_http_response_append(ctx, xml, strlen(xml));
+    mtev_http_response_ok(ctx, "text/xml");
   }
 
   if(xml) free(xml);
-  noit_http_response_end(ctx);
+  mtev_http_response_end(ctx);
   return 0;
 }
 
 void
 stratcon_datastore_iep_check_preload() {
+  if(!ingestor) {
+    mtevL(noit_error, "No ingestor!\n");
+    exit(2);
+  }
   ingestor->iep_check_preload();
 }
 
 int
 stratcon_datastore_saveconfig(void *unused) {
+  if(!ingestor) {
+    mtevL(noit_error, "No ingestor!\n");
+    exit(2);
+  }
   return ingestor->save_config();
 }
 
@@ -473,15 +430,15 @@ stratcon_datastore_core_init() {
   static int initialized = 0;
   if(initialized) return;
   initialized = 1;
-  ds_err = noit_log_stream_find("error/datastore");
-  ds_deb = noit_log_stream_find("debug/datastore");
-  ds_pool_deb = noit_log_stream_find("debug/datastore_pool");
-  ingest_err = noit_log_stream_find("error/ingest");
+  ds_err = mtev_log_stream_find("error/datastore");
+  ds_deb = mtev_log_stream_find("debug/datastore");
+  ds_pool_deb = mtev_log_stream_find("debug/datastore_pool");
+  ingest_err = mtev_log_stream_find("error/ingest");
   if(!ds_err) ds_err = noit_error;
   if(!ingest_err) ingest_err = noit_error;
-  if(!noit_conf_get_string(NULL, "//database/journal/path",
+  if(!mtev_conf_get_string(NULL, "//database/journal/path",
                            &basejpath)) {
-    noitL(noit_error, "//database/journal/path is unspecified\n");
+    mtevL(noit_error, "//database/journal/path is unspecified\n");
     exit(-1);
   }
 }
@@ -492,12 +449,13 @@ stratcon_datastore_init() {
   initialized = 1;
   stratcon_datastore_core_init();
 
-  stratcon_ingest_sweep_journals(is_raw_ingestion_file,
+  stratcon_ingest_sweep_journals(basejpath,
+                                 is_raw_ingestion_file,
                                  stratcon_ingest);
 
-  assert(noit_http_rest_register_auth(
+  assert(mtev_http_rest_register_auth(
     "GET", "/noits/", "^config$", rest_get_noit_config,
-             noit_http_rest_client_cert_auth
+             mtev_http_rest_client_cert_auth
   ) == 0);
 }
 

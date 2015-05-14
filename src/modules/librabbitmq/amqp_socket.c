@@ -1,3 +1,4 @@
+/* MOZILLA PUBLIC LICENSE Version 1.1 -- see LICENSE-MPL-RabbitMQ */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -6,11 +7,13 @@
 #include <stdarg.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <mtev_log.h>
 
 #include "amqp.h"
 #include "amqp_framing.h"
 #include "amqp_private.h"
 
+#include <eventer/eventer.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -34,11 +37,13 @@ int amqp_open_socket(char const *hostname,
     return -ENOENT;
   }
 
+  memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons(portnumber);
   addr.sin_addr.s_addr = * (uint32_t *) he->h_addr_list[0];
 
-  sockfd = socket(PF_INET, SOCK_STREAM, 0);
+  sockfd = socket(PF_INET, NE_SOCK_CLOEXEC|SOCK_STREAM, 0);
+  if(sockfd < 0) return -1;
   if(((flags = fcntl(sockfd, F_GETFL, 0)) == -1) ||
      (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1)) {
     result = -errno;
@@ -77,8 +82,8 @@ good:
     return result;
   }
   if(timeout) {
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, timeout, sizeof(*timeout));
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, timeout, sizeof(*timeout));
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, timeout, sizeof(*timeout));
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, timeout, sizeof(*timeout));
   }
   return sockfd;
 }
@@ -97,7 +102,11 @@ static char *header() {
 }
 
 int amqp_send_header(amqp_connection_state_t state) {
-  return write(state->sockfd, header(), 8);
+  int ret = eintr_safe_write(state->sockfd, header(), 8);
+  if (ret < 0) {
+    mtevL(mtev_error, "Failed to write header in amqp_send_header, size 8\n");
+  }
+  return ret;
 }
 
 int amqp_send_header_to(amqp_connection_state_t state,
@@ -176,10 +185,11 @@ static int wait_frame_inner(amqp_connection_state_t state,
       assert(result != 0);
     }	
 
-    result = read(state->sockfd,
+    result = eintr_safe_read(state->sockfd,
 		  state->sock_inbound_buffer.bytes,
 		  state->sock_inbound_buffer.len);
     if (result < 0) {
+      mtevL(mtev_error, "Failed to read message in wait_frame_inner, size %d\n", state->sock_inbound_buffer.len);
       return -errno;
     }
     if (result == 0) {
@@ -345,8 +355,8 @@ static int amqp_login_inner(amqp_connection_state_t state,
 
   if(heartbeat != 0) {
     hb.tv_sec = 2*heartbeat; hb.tv_usec = 0;
-    setsockopt(state->sockfd, SOL_SOCKET, SO_RCVTIMEO, &hb, sizeof(hb));
-    setsockopt(state->sockfd, SOL_SOCKET, SO_SNDTIMEO, &hb, sizeof(hb));
+    (void)setsockopt(state->sockfd, SOL_SOCKET, SO_RCVTIMEO, &hb, sizeof(hb));
+    (void)setsockopt(state->sockfd, SOL_SOCKET, SO_SNDTIMEO, &hb, sizeof(hb));
   }
 
   amqp_send_header(state);
@@ -399,8 +409,8 @@ static int amqp_login_inner(amqp_connection_state_t state,
   }
   if(heartbeat != 0) {
     hb.tv_sec = 2*heartbeat; hb.tv_usec = 0;
-    setsockopt(state->sockfd, SOL_SOCKET, SO_RCVTIMEO, &hb, sizeof(hb));
-    setsockopt(state->sockfd, SOL_SOCKET, SO_SNDTIMEO, &hb, sizeof(hb));
+    (void)setsockopt(state->sockfd, SOL_SOCKET, SO_RCVTIMEO, &hb, sizeof(hb));
+    (void)setsockopt(state->sockfd, SOL_SOCKET, SO_SNDTIMEO, &hb, sizeof(hb));
   }
 
   (void)AMQP_CHECK_RESULT(amqp_tune_connection(state, channel_max, frame_max, heartbeat));
@@ -449,6 +459,7 @@ amqp_rpc_reply_t amqp_login(amqp_connection_state_t state,
 			     (amqp_method_number_t *) &replies,
 			     &s);
     if (result.reply_type != AMQP_RESPONSE_NORMAL) {
+      va_end(vl);
       return result;
     }
   }

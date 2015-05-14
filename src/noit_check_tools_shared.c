@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2007, OmniTI Computer Consulting, Inc.
  * All rights reserved.
+ * Copyright (c) 2015, Circonus, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,30 +31,36 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "noit_defines.h"
-#include "noit_check_tools.h"
-#include "utils/noit_str.h"
+#include <mtev_defines.h>
 
 #include <assert.h>
 
-static noit_hash_table interpolation_operators = NOIT_HASH_EMPTY;
+#include <mtev_str.h>
+
+#include "noit_check_tools.h"
+
+static mtev_hash_table interpolation_operators = MTEV_HASH_EMPTY;
 
 static int
-interpolate_oper_copy(char *buff, int len, const char *replacement) {
+interpolate_oper_copy(char *buff, int len, const char *key,
+                      const char *replacement) {
+  (void)key;
   strlcpy(buff, replacement, len);
   return strlen(buff);
 }
 static int
-interpolate_oper_ccns(char *buff, int len, const char *replacement) {
+interpolate_oper_ccns(char *buff, int len, const char *key,
+                      const char *replacement) {
   char *start;
   start = strstr(replacement, "::");
-  return interpolate_oper_copy(buff, len, start ? (start + 2) : replacement);
+  return interpolate_oper_copy(buff, len, key,
+                               start ? (start + 2) : replacement);
 }
 
 int
 noit_check_interpolate_register_oper_fn(const char *name,
                                         intperpolate_oper_fn f) {
-  noit_hash_replace(&interpolation_operators,
+  mtev_hash_replace(&interpolation_operators,
                     strdup(name), strlen(name),
                     (void *)f,
                     free, NULL);
@@ -62,11 +69,13 @@ noit_check_interpolate_register_oper_fn(const char *name,
 
 int
 noit_check_interpolate(char *buff, int len, const char *fmt,
-                       noit_hash_table *attrs,
-                       noit_hash_table *config) {
+                       mtev_hash_table *attrs,
+                       mtev_hash_table *config) {
   char *copy = NULL;
   char closer;
   const char *fmte, *key;
+  char keycopy[128];
+  int keylen;
   int replaced_something = 1;
   int iterations = 3;
 
@@ -94,11 +103,12 @@ noit_check_interpolate(char *buff, int len, const char *fmt,
                 void *voper;
                 oper++;
                 /* find oper, nkey-oper */
-                if(!noit_hash_retrieve(&interpolation_operators,
+                if(!mtev_hash_retrieve(&interpolation_operators,
                                        oper, nkey - oper,
                                        &voper)) {
-                  /* else oper <- copy */
-                  oper_sprint = interpolate_oper_copy;
+                  /* this isn't an understood interpolator */
+                  *cp++ = *fmt++;
+                  continue;
                 }
                 else
                   oper_sprint = (intperpolate_oper_fn)voper;
@@ -108,11 +118,16 @@ noit_check_interpolate(char *buff, int len, const char *fmt,
                 oper_sprint = interpolate_oper_copy;
                 nkey = key;
               }
-              if(!noit_hash_retr_str((closer == '}') ?  config : attrs,
-                                     nkey, fmte - nkey, &replacement))
+              /* make a C string copy to pass to the interpolation function */
+              keylen = fmte - nkey;
+              memcpy(keycopy, nkey, MIN(sizeof(keycopy)-1, keylen));
+              keycopy[MIN(sizeof(keycopy)-1,keylen)] = '\0';
+
+              if(!mtev_hash_retr_str((closer == '}') ?  config : attrs,
+                                     nkey, keylen, &replacement))
                 replacement = "";
               fmt = fmte + 1; /* Format points just after the end of the key */
-              cp += oper_sprint(cp, end-cp, replacement);
+              cp += oper_sprint(cp, end-cp, keycopy, replacement);
               *(end-1) = '\0'; /* In case the oper_sprint didn't teminate */
               replaced_something = 1;
               break;
@@ -124,6 +139,7 @@ noit_check_interpolate(char *buff, int len, const char *fmt,
     }
     *cp = '\0';
     if(copy) free(copy);
+    copy = NULL;
     if(replaced_something)
       copy = strdup(buff);
     fmt = copy;
@@ -178,21 +194,31 @@ noit_check_extended_id_split(const char *in, int len,
 }
 
 void
-noit_check_make_attrs(noit_check_t *check, noit_hash_table *attrs) {
-#define CA_STORE(a,b) noit_hash_store(attrs, a, strlen(a), b)
-  CA_STORE("target", check->target);
-  CA_STORE("target_ip", check->target_ip);
-  CA_STORE("name", check->name);
-  CA_STORE("module", check->module);
+noit_check_release_attrs(mtev_hash_table *attrs) {
+  mtev_hash_destroy(attrs, NULL, NULL);
 }
-void
-noit_check_release_attrs(noit_hash_table *attrs) {
-  noit_hash_destroy(attrs, NULL, NULL);
+
+static int
+interpolate_oper_random(char *buff, int len, const char *key,
+                        const char *replacement) {
+  if(!strcmp(key, "integer")) {
+    long val = lrand48();
+    return snprintf(buff, len, "%lld", (long long int)val);
+  }
+  else if(!strcmp(key, "uuid")) {
+    uuid_t val;
+    char val_str[UUID_STR_LEN+1];
+    uuid_generate(val);
+    uuid_unparse_lower(val, val_str);
+    return snprintf(buff, len, "%s", val_str);
+  }
+  return snprintf(buff, len, "random_what");
 }
 
 void
 noit_check_tools_shared_init() {
   noit_check_interpolate_register_oper_fn("copy", interpolate_oper_copy);
   noit_check_interpolate_register_oper_fn("ccns", interpolate_oper_ccns);
+  noit_check_interpolate_register_oper_fn("random", interpolate_oper_random);
 }
 
